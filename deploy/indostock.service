@@ -1,0 +1,23 @@
+[Unit]
+Description=Indostock CLI Service (Go DDD + Orderbook + Whale/Regime/Signal)
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/apps/indostock
+ExecStart=/usr/local/bin/indostock serve --port 18080
+Restart=always
+RestartSec=5
+Environment=REDIS_URL=redis://localhost:6379/0
+Environment=DATABASE_URL=postgres://indostock:indostock@localhost:5432/indostock?sslmode=disable
+Environment=STOCKBIT_TOKEN=
+Environment=PORT=18080
+Environment=LOG_LEVEL=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=indostock
+
+[Install]
+WantedBy=multi-user.target
