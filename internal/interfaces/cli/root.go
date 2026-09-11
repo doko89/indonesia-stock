@@ -1,26 +1,26 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	"github.com/robfig/cron/v3"
 	finapp "indonesia-stock/internal/application/financial"
 	orderbookapp "indonesia-stock/internal/application/orderbook"
 	"indonesia-stock/internal/application/quote"
 	findomain "indonesia-stock/internal/domain/financial"
 	"indonesia-stock/internal/domain/orderbook"
 	"indonesia-stock/internal/domain/signal"
+	"indonesia-stock/internal/infrastructure/cache"
 	"indonesia-stock/internal/infrastructure/scraper/idx"
 	"indonesia-stock/internal/infrastructure/scraper/rti"
 	"indonesia-stock/internal/infrastructure/scraper/stockbit"
 	"indonesia-stock/internal/infrastructure/scraper/yahoo"
-	"indonesia-stock/internal/infrastructure/cache"
 	"indonesia-stock/pkg/auth"
 	"indonesia-stock/pkg/config"
-	"bufio"
-	"github.com/robfig/cron/v3"
+	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -358,6 +358,7 @@ func runOrderbook(cfg config.Config, rest []string) int {
 	}
 
 	client := stockbit.New(cfg.StockbitBaseURL, cfg.StockbitToken)
+	client.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
 	svc := orderbookapp.New(client)
 
 	if watch {
@@ -388,9 +389,9 @@ func runOrderbook(cfg config.Config, rest []string) int {
 	ob, err := svc.Get(ctx, symbol)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "orderbook error: %v\n", err)
-		hint := "Set STOCKBIT_TOKEN (export STOCKBIT_TOKEN=xxx) atau gunakan --mock untuk test offline"
+		hint := "save tokens from browser login via 'indostock auth save --token <JWT> --refresh <JWT> (or --stdin), then indostock auth status --json to verify.' (ADR-0009)"
 		if cfg.StockbitToken == "" {
-			hint += " | Cara dapat token: POST https://api.stockbit.com/v2/login atau DevTools stockbit.com -> Network -> Authorization: Bearer ..."
+			hint += " | ADR-0009: server logins trigger OTP and fail; use browser token capture"
 		}
 		outputJSON(map[string]any{"error": err.Error(), "symbol": symbol, "hint": hint, "endpoint": "https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/" + symbol}, compact)
 		return 1
@@ -496,6 +497,7 @@ func runSnapshot(cfg config.Config, rest []string) int {
 	yClient := yahoo.New(cfg.YahooBaseURL)
 	qSvc := quote.New(yClient)
 	sClient := stockbit.New(cfg.StockbitBaseURL, cfg.StockbitToken)
+	sClient.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
 	obSvc := orderbookapp.New(sClient)
 
 	type result struct {
@@ -697,8 +699,12 @@ func mockQuote(symbol string) map[string]any {
 		price = v
 	} else {
 		h := 0
-		for _, c := range symbol { h = h*31 + int(c) }
-		if h < 0 { h = -h }
+		for _, c := range symbol {
+			h = h*31 + int(c)
+		}
+		if h < 0 {
+			h = -h
+		}
 		price = 400 + float64(h%15000)
 	}
 	price = price * (0.98 + rand.Float64()*0.04)
@@ -728,14 +734,22 @@ func mockHistory(symbol, interval, rangeStr string) []map[string]any {
 	base := mockQuote(symbol)["price"].(float64)
 	count := 30
 	switch rangeStr {
-	case "1d": count = 7
-	case "5d": count = 5
-	case "1mo": count = 22
-	case "3mo": count = 60
-	case "1y": count = 250
-	case "5y": count = 60
+	case "1d":
+		count = 7
+	case "5d":
+		count = 5
+	case "1mo":
+		count = 22
+	case "3mo":
+		count = 60
+	case "1y":
+		count = 250
+	case "5y":
+		count = 60
 	}
-	if count > 120 { count = 120 }
+	if count > 120 {
+		count = 120
+	}
 	var out []map[string]any
 	price := base
 	now := time.Now()
@@ -995,6 +1009,7 @@ func runSignal(cfg config.Config, rest []string) int {
 		regimeRes = signal.RegimeResult{Symbol: symbol, Regime: reg, ATR: atr, ATRPercent: atrPct, EMASlopePct: emaSlope}
 		// orderbook live
 		sClient := stockbit.New(cfg.StockbitBaseURL, cfg.StockbitToken)
+		sClient.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
 		obSvc := orderbookapp.New(sClient)
 		ob, err := obSvc.Get(ctx, symbol)
 		if err == nil {
@@ -1159,25 +1174,25 @@ func runServe(cfg config.Config, rest []string) int {
 	}
 	c := cron.New(cron.WithLocation(wib))
 	_, _ = c.AddFunc("0 * * * *", func() {
-			rc2 := cache.New(cfg.RedisURL)
-			if !rc2.Available() {
-				return
+		rc2 := cache.New(cfg.RedisURL)
+		if !rc2.Available() {
+			return
+		}
+		t, err := auth.LoadFromRedis(rc2)
+		if err != nil || t.RefreshToken == "" {
+			return
+		}
+		if auth.IsExpired(t, 30*time.Minute) {
+			log.Printf("cron: token will expire in %v, refreshing...", time.Until(t.ExpiresAt))
+			if nt, err := auth.Refresh(t); err == nil {
+				_ = auth.SaveToRedis(rc2, nt)
+				_ = auth.Save(nt, "")
+				log.Printf("cron: refreshed new expiry %s", nt.ExpiresAt.Format(time.RFC3339))
+			} else {
+				log.Printf("cron: refresh failed: %v", err)
 			}
-			t, err := auth.LoadFromRedis(rc2)
-			if err != nil || t.RefreshToken == "" {
-				return
-			}
-			if auth.IsExpired(t, 30*time.Minute) {
-				log.Printf("cron: token will expire in %v, refreshing...", time.Until(t.ExpiresAt))
-				if nt, err := auth.Refresh(t); err == nil {
-					_ = auth.SaveToRedis(rc2, nt)
-					_ = auth.Save(nt, "")
-					log.Printf("cron: refreshed new expiry %s", nt.ExpiresAt.Format(time.RFC3339))
-				} else {
-					log.Printf("cron: refresh failed: %v", err)
-				}
-			}
-		})
+		}
+	})
 	c.Start()
 	defer c.Stop()
 	fmt.Fprintf(os.Stderr, "indostock serve listening on :%s (REDIS_URL=%s DATABASE_URL=%s) cron:WIB hourly+04:00\n", port, cfg.RedisURL, cfg.DatabaseURL)
@@ -1324,5 +1339,5 @@ func httpStatusText(code int) string {
 	}
 }
 
-func bufioNewReader(c net.Conn) *bufio.Reader { return bufio.NewReader(c) }
+func bufioNewReader(c net.Conn) *bufio.Reader                { return bufio.NewReader(c) }
 func httpReadRequest(r *bufio.Reader) (*http.Request, error) { return http.ReadRequest(r) }

@@ -3,10 +3,16 @@ package config
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"indonesia-stock/internal/infrastructure/cache"
 	"indonesia-stock/pkg/auth"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 type Config struct {
@@ -21,12 +27,179 @@ type Config struct {
 	DatabaseURL     string
 }
 
+var authWiredOnce sync.Once
+
+// wiredCache is the redis client used for auth wiring, or nil when redis is
+// unavailable (then the auth package stays in file-lock-only mode).
+var wiredCache *cache.Client
+
+// ensureAuthWiring publishes auth hooks only when redis is reachable.
+// Every read of wiredCache follows an Once.Do call, which provides the
+// happens-before edge for the write inside Do.
+func ensureAuthWiring(redisURL string) *cache.Client {
+	authWiredOnce.Do(func() {
+		c := cache.New(redisURL)
+		if !c.Available() {
+			return
+		}
+		wiredCache = c
+		auth.SetSecondaryStore(&redisStore{client: c})
+		auth.SetLocker(&redisLocker{addr: redisAddr(redisURL)})
+	})
+	return wiredCache
+}
+
+func redisAddr(redisURL string) string {
+	addr := "localhost:6379"
+	if strings.HasPrefix(redisURL, "redis://") {
+		h := strings.TrimPrefix(redisURL, "redis://")
+		if idx := strings.Index(h, "/"); idx != -1 {
+			h = h[:idx]
+		}
+		if h != "" {
+			addr = h
+		}
+		if !strings.Contains(addr, ":") {
+			addr += ":6379"
+		}
+	} else if redisURL != "" && strings.Contains(redisURL, ":") {
+		addr = redisURL
+	}
+	return addr
+}
+
+type redisStore struct {
+	client *cache.Client
+}
+
+func (s *redisStore) Save(t *auth.StoredToken) error {
+	return auth.SaveToRedis(s.client, t)
+}
+
+func (s *redisStore) Load() (*auth.StoredToken, error) {
+	return auth.LoadFromRedis(s.client)
+}
+
+type redisLocker struct {
+	addr string
+}
+
+func (l *redisLocker) TryLock(id string, ttl time.Duration) bool {
+	conn, err := net.DialTimeout("tcp", l.addr, 800*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	key := "indostock:auth:lock"
+	px := fmt.Sprintf("%d", ttl.Milliseconds())
+	args := []string{"SET", key, id, "NX", "PX", px}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
+	for _, a := range args {
+		b.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(a), a))
+	}
+	if _, err := conn.Write([]byte(b.String())); err != nil {
+		return false
+	}
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	line = strings.TrimSpace(line)
+	if line == "+OK" {
+		return true
+	}
+	return false
+}
+
+func (l *redisLocker) Unlock(id string) {
+	conn, err := net.DialTimeout("tcp", l.addr, 800*time.Millisecond)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	key := "indostock:auth:lock"
+	getCmd := fmt.Sprintf("*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+	if _, err := conn.Write([]byte(getCmd)); err != nil {
+		return
+	}
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		return
+	}
+	line = strings.TrimSpace(line)
+	if line == "$-1" {
+		return
+	}
+	if !strings.HasPrefix(line, "$") {
+		return
+	}
+	var n int
+	if _, err := fmt.Sscan(line[1:], &n); err != nil {
+		return
+	}
+	buf := make([]byte, n+2)
+	if _, err := io.ReadFull(br, buf); err != nil {
+		return
+	}
+	val := string(buf[:n])
+	if val != id {
+		return
+	}
+	_ = conn.Close()
+	conn2, err := net.DialTimeout("tcp", l.addr, 800*time.Millisecond)
+	if err != nil {
+		return
+	}
+	defer conn2.Close()
+	_ = conn2.SetDeadline(time.Now().Add(2 * time.Second))
+	delCmd := fmt.Sprintf("*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
+	_, _ = conn2.Write([]byte(delCmd))
+	br2 := bufio.NewReader(conn2)
+	_, _ = br2.ReadString('\n')
+}
+
 func Load() Config {
 	redisURL := env("REDIS_URL", "redis://localhost:6379/0")
-	token := env("STOCKBIT_TOKEN", "")
-	if token == "" {
-		// coba redis dulu (source of truth saat serve jalan)
-		// pakai lazy import via interface biar tidak circular - fallback ke file jika redis tidak ada
+	rc := ensureAuthWiring(redisURL)
+
+	envToken := env("STOCKBIT_TOKEN", "")
+	envRefresh := strings.TrimSpace(os.Getenv("STOCKBIT_REFRESH_TOKEN"))
+
+	// stored candidate with a refresh token (redis first, then file),
+	// loaded without env shadowing so auto-refresh keeps working.
+	var stored *auth.StoredToken
+	if rc != nil {
+		if t, err := auth.LoadFromRedis(rc); err == nil && t != nil && t.RefreshToken != "" {
+			stored = t
+		}
+	}
+	if stored == nil {
+		if p := auth.FindTokenFile(); p != "" {
+			if t, err := auth.LoadFrom(p); err == nil && t.RefreshToken != "" {
+				stored = t
+			}
+		}
+	}
+
+	var token string
+	if envToken != "" && envRefresh == "" && stored != nil && stored.RefreshToken != "" {
+		token = stored.AccessToken
+		if auth.IsExpired(stored, 5*time.Minute) {
+			if v, err := auth.ForceRefresh(); err == nil && v != "" {
+				token = v
+			} else if auth.IsExpired(stored, 0) {
+				// stored is expired and cannot be rotated: fall back to env.
+				token = envToken
+			}
+		}
+	} else if envToken != "" {
+		token = envToken
+	} else {
 		if t, err := auth.Load(); err == nil && t.AccessToken != "" {
 			if v, err := auth.GetValidToken(); err == nil {
 				token = v
@@ -38,7 +211,6 @@ func Load() Config {
 			token = tokenFromFile()
 		}
 	}
-	_ = redisURL
 
 	return Config{
 		Port:            env("PORT", "8080"),

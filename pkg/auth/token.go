@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,13 +23,63 @@ type StoredToken struct {
 }
 
 var (
-	mu           sync.RWMutex
-	cached       *StoredToken
 	defaultPaths = []string{
 		"/apps/indostock/token.json",
 		"/etc/indostock/token.json",
 	}
+	secondaryStore Store
+	secondaryMu    sync.RWMutex
+	locker         Locker
+	lockerMu       sync.RWMutex
 )
+
+// Store is a secondary persistence for tokens (e.g. Redis).
+type Store interface {
+	Save(*StoredToken) error
+	Load() (*StoredToken, error)
+}
+
+// SetSecondaryStore sets the secondary store used by Refresh (best-effort).
+func SetSecondaryStore(s Store) {
+	secondaryMu.Lock()
+	defer secondaryMu.Unlock()
+	secondaryStore = s
+}
+
+func getSecondaryStore() Store {
+	secondaryMu.RLock()
+	defer secondaryMu.RUnlock()
+	return secondaryStore
+}
+
+// Locker provides distributed lock (e.g. Redis SET NX PX).
+type Locker interface {
+	TryLock(id string, ttl time.Duration) bool
+	Unlock(id string)
+}
+
+// SetLocker sets the distributed locker.
+func SetLocker(l Locker) {
+	lockerMu.Lock()
+	defer lockerMu.Unlock()
+	locker = l
+}
+
+func getLocker() Locker {
+	lockerMu.RLock()
+	defer lockerMu.RUnlock()
+	return locker
+}
+
+func newUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// fallback to hex of time
+		return fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	}
+	// format as hex
+	return hex.EncodeToString(b)
+}
 
 func TokenFileCandidates() []string {
 	paths := append([]string{}, defaultPaths...)
@@ -272,10 +324,88 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		path = TokenFileCandidates()[0]
 	}
 	_ = Save(nt, path)
-	mu.Lock()
-	cached = nt
-	mu.Unlock()
+	// also save to secondary store if set (best-effort)
+	if s := getSecondaryStore(); s != nil {
+		if err := s.Save(nt); err != nil {
+			fmt.Fprintf(os.Stderr, "secondary store save failed: %v\n", err)
+		}
+	}
 	return nt, nil
+}
+
+// ForceRefresh reloads current token and refreshes even if not expired, guarded by same lock.
+func ForceRefresh() (string, error) {
+	t, err := loadBestToken()
+	if err != nil {
+		return "", err
+	}
+	if t.RefreshToken == "" {
+		return "", fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
+	}
+	locked, release := acquireRefreshLock()
+	if !locked {
+		// wait polling for lock
+		for i := 0; i < 10; i++ {
+			time.Sleep(500 * time.Millisecond)
+			locked, release = acquireRefreshLock()
+			if locked {
+				break
+			}
+		}
+		if !locked {
+			return "", fmt.Errorf("could not acquire refresh lock after waiting")
+		}
+	}
+	defer release()
+	// reload after acquiring lock to get freshest token
+	if nt, err := loadBestToken(); err == nil && nt.RefreshToken != "" {
+		t = nt
+	}
+	nt, err := Refresh(t)
+	if err != nil {
+		return "", err
+	}
+	return nt.AccessToken, nil
+}
+
+func loadBestToken() (*StoredToken, error) {
+	if s := getSecondaryStore(); s != nil {
+		if t, err := s.Load(); err == nil && t != nil && t.AccessToken != "" {
+			return t, nil
+		}
+	}
+	return Load()
+}
+
+// acquireRefreshLock tries Redis locker first, falls back to file lock.
+func acquireRefreshLock() (bool, func()) {
+	if l := getLocker(); l != nil {
+		id := newUUID()
+		if l.TryLock(id, 15*time.Second) {
+			return true, func() { l.Unlock(id) }
+		}
+		return false, func() {}
+	}
+	// file fallback
+	return acquireFileLock()
+}
+
+func acquireFileLock() (bool, func()) {
+	lockPath := "/tmp/indostock_refresh.lock"
+	// stale detection: if lockfile older than 30s, remove
+	if fi, err := os.Stat(lockPath); err == nil {
+		if time.Since(fi.ModTime()) > 30*time.Second {
+			_ = os.Remove(lockPath)
+		}
+	}
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return false, func() {}
+	}
+	return true, func() {
+		f.Close()
+		os.Remove(lockPath)
+	}
 }
 
 func GetValidToken() (string, error) {
@@ -285,26 +415,65 @@ func GetValidToken() (string, error) {
 	}
 	if IsExpired(t, 5*time.Minute) {
 		if t.RefreshToken != "" {
-			lockPath := "/tmp/indostock_refresh.lock"
-			if f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0600); err == nil {
-				defer func() { f.Close(); os.Remove(lockPath) }()
-				nt, err := Refresh(t)
+			locked, release := acquireRefreshLock()
+			if locked {
+				defer release()
+				// reload after acquiring: a peer may have rotated just before us
+				src := t
+				if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" {
+					if !IsExpired(cur, 5*time.Minute) {
+						return cur.AccessToken, nil
+					}
+					src = cur
+				}
+				nt, err := Refresh(src)
 				if err != nil {
 					return "", fmt.Errorf("auto-refresh failed: %w", err)
 				}
 				return nt.AccessToken, nil
-			} else {
-				// another process refreshing, wait 1s and reload
-				time.Sleep(1200 * time.Millisecond)
-				if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
-					return nt.AccessToken, nil
-				}
-				if t.RefreshToken != "" {
-					nt, err := Refresh(t)
-					if err == nil {
+			}
+			// lock not acquired: wait up to ~5s polling Load() (secondary first, then file) every 500ms
+			for i := 0; i < 10; i++ {
+				time.Sleep(500 * time.Millisecond)
+				// try secondary store first
+				if s := getSecondaryStore(); s != nil {
+					if nt, err := s.Load(); err == nil && nt != nil && !IsExpired(nt, 5*time.Minute) {
 						return nt.AccessToken, nil
 					}
 				}
+				if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
+					return nt.AccessToken, nil
+				}
+			}
+			// after polling, try to acquire lock again and refresh with freshly loaded token
+			locked2, release2 := acquireRefreshLock()
+			if locked2 {
+				defer release2()
+				// reload latest token before refreshing (Fix 1: use nt not t)
+				if nt, err := loadBestToken(); err == nil && nt != nil && nt.RefreshToken != "" {
+					// if nt is still expired, refresh nt
+					if IsExpired(nt, 5*time.Minute) {
+						refreshed, err := Refresh(nt)
+						if err == nil {
+							return refreshed.AccessToken, nil
+						}
+						return "", fmt.Errorf("auto-refresh failed: %w", err)
+					}
+					return nt.AccessToken, nil
+				}
+				// never Refresh(t) with the pre-wait token: its refresh token may
+				// have been retired by the peer's rotation. Without a freshly
+				// loaded refreshable token there is nothing safe to rotate with.
+				return "", fmt.Errorf("auto-refresh failed: could not reload a refreshable token")
+			}
+			// still no lock: try one final load
+			if s := getSecondaryStore(); s != nil {
+				if nt, err := s.Load(); err == nil && nt != nil && !IsExpired(nt, 5*time.Minute) {
+					return nt.AccessToken, nil
+				}
+			}
+			if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
+				return nt.AccessToken, nil
 			}
 		}
 		if IsExpired(t, 0) {
@@ -340,7 +509,10 @@ func Status() map[string]any {
 
 const RedisKey = "indostock:auth:stockbit"
 
-func SaveToRedis(cacheClient interface{ Get(string) (string, error); SetEx(string, string, time.Duration) error }, t *StoredToken) error {
+func SaveToRedis(cacheClient interface {
+	Get(string) (string, error)
+	SetEx(string, string, time.Duration) error
+}, t *StoredToken) error {
 	if t.ExpiresAt.IsZero() && t.AccessToken != "" {
 		if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
 			t.ExpiresAt = exp
@@ -375,18 +547,42 @@ func LoadFromRedis(cacheClient interface{ Get(string) (string, error) }) (*Store
 	return &t, nil
 }
 
-func GetValidTokenRedis(cacheClient interface{ Get(string) (string, error); SetEx(string, string, time.Duration) error }) (string, error) {
+func GetValidTokenRedis(cacheClient interface {
+	Get(string) (string, error)
+	SetEx(string, string, time.Duration) error
+}) (string, error) {
 	if cacheClient != nil {
 		if t, err := LoadFromRedis(cacheClient); err == nil && t.AccessToken != "" {
 			if !IsExpired(t, 5*time.Minute) {
 				return t.AccessToken, nil
 			}
 			if t.RefreshToken != "" {
-				nt, err := Refresh(t)
-				if err == nil {
-					_ = SaveToRedis(cacheClient, nt)
-					_ = Save(nt, "")
-					return nt.AccessToken, nil
+				if locked, release := acquireRefreshLock(); locked {
+					// reload freshest under lock: a peer may have rotated
+					// already, and t's refresh token may be retired.
+					src := t
+					if cur, err := LoadFromRedis(cacheClient); err == nil && cur.RefreshToken != "" {
+						src = cur
+					} else if cur, err := Load(); err == nil && cur.RefreshToken != "" {
+						src = cur
+					}
+					nt, err := Refresh(src)
+					release()
+					if err == nil {
+						_ = SaveToRedis(cacheClient, nt)
+						_ = Save(nt, "")
+						return nt.AccessToken, nil
+					}
+				} else {
+					// peer is refreshing: wait briefly, then use a freshly
+					// loaded token — never rotate with the stale t.
+					time.Sleep(1200 * time.Millisecond)
+					if nt, err := LoadFromRedis(cacheClient); err == nil && !IsExpired(nt, 5*time.Minute) {
+						return nt.AccessToken, nil
+					}
+					if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
+						return nt.AccessToken, nil
+					}
 				}
 			}
 			if !IsExpired(t, 0) {
@@ -396,4 +592,3 @@ func GetValidTokenRedis(cacheClient interface{ Get(string) (string, error); SetE
 	}
 	return GetValidToken()
 }
-

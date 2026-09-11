@@ -13,9 +13,10 @@ import (
 )
 
 type Client struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	baseURL        string
+	token          string
+	http           *http.Client
+	OnAuthRejected func() string
 }
 
 func New(baseURL, token string) *Client {
@@ -40,19 +41,29 @@ func (c *Client) GetOrderbook(ctx context.Context, symbol string) (*orderbook.Or
 		fmt.Sprintf("%s/v2.2/orderbook/%s", c.baseURL, symbol),
 	}
 	var lastErr error
-	for _, url := range endpoints {
-		ob, err := c.fetch(ctx, url, symbol)
+	for i, url := range endpoints {
+		ob, status, err := c.fetch(ctx, url, symbol)
 		if err == nil {
 			return ob, nil
 		}
+		if i == 0 && (status == http.StatusUnauthorized || status == http.StatusForbidden) && c.OnAuthRejected != nil {
+			if fresh := c.OnAuthRejected(); fresh != "" {
+				c.token = fresh
+				if ob2, _, err2 := c.fetch(ctx, url, symbol); err2 == nil {
+					return ob2, nil
+				} else {
+					lastErr = err2
+					continue
+				}
+			}
+		}
 		lastErr = err
-		// 401/403 on first endpoint means token issue, still try next endpoint
 	}
-	hint := "Set STOCKBIT_TOKEN env: export STOCKBIT_TOKEN=$(curl -s -X POST https://api.stockbit.com/v2/login -d 'username=...&password=...' | jq -r .data.access_token)  atau ambil dari DevTools Stockbit.com > Network > Authorization: Bearer ... ; untuk test tanpa token gunakan --mock"
+	hint := "save tokens from browser login via 'indostock auth save --token <JWT> --refresh <JWT> (or --stdin), then indostock auth status --json to verify.' (ADR-0009: server logins trigger OTP and fail; browser is source of truth) ; untuk test tanpa token gunakan --mock"
 	return nil, fmt.Errorf("stockbit orderbook failed for %s: %w (%s)", symbol, lastErr, hint)
 }
 
-func (c *Client) fetch(ctx context.Context, url, symbol string) (*orderbook.Orderbook, error) {
+func (c *Client) fetch(ctx context.Context, url, symbol string) (*orderbook.Orderbook, int, error) {
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -67,7 +78,7 @@ func (c *Client) fetch(ctx context.Context, url, symbol string) (*orderbook.Orde
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
@@ -76,20 +87,20 @@ func (c *Client) fetch(ctx context.Context, url, symbol string) (*orderbook.Orde
 		if n > 500 {
 			n = 500
 		}
-		return nil, fmt.Errorf("%d %s url=%s", resp.StatusCode, string(body[:n]), url)
+		return nil, resp.StatusCode, fmt.Errorf("%d %s url=%s", resp.StatusCode, string(body[:n]), url)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, resp.StatusCode, err
 	}
 	parsed, err := parseStockbitBody(body, symbol)
 	if err != nil {
-		return nil, fmt.Errorf("parse: %w body=%.500s", err, string(body))
+		return nil, resp.StatusCode, fmt.Errorf("parse: %w body=%.500s", err, string(body))
 	}
 	parsed.Timestamp = time.Now()
 	parsed.Source = "stockbit"
 	parsed.Symbol = symbol
-	return parsed, nil
+	return parsed, resp.StatusCode, nil
 }
 
 func parseStockbitBody(body []byte, symbol string) (*orderbook.Orderbook, error) {
