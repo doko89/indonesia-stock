@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -102,22 +104,13 @@ func FindTokenFile() string {
 }
 
 func Load() (*StoredToken, error) {
-	if v := os.Getenv("STOCKBIT_TOKEN"); v != "" {
-		rf := os.Getenv("STOCKBIT_REFRESH_TOKEN")
-		t := &StoredToken{AccessToken: strings.TrimSpace(v), RefreshToken: strings.TrimSpace(rf)}
-		if t.AccessToken != "" {
-			exp := jwtExpiry(t.AccessToken)
-			if !exp.IsZero() {
-				t.ExpiresAt = exp
-			} else {
-				t.ExpiresAt = time.Now().Add(24 * time.Hour)
-			}
-			return t, nil
-		}
-	}
+	// NOTE: env STOCKBIT_TOKEN support was REMOVED on purpose.
+	// An env var with a stale token shadowed the on-disk token twice
+	// (2026-09-02 and 2026-09-12 incidents) and killed auto-refresh.
+	// token.json (0600) is the single source of truth; Redis is a cache.
 	path := FindTokenFile()
 	if path == "" {
-		return nil, fmt.Errorf("token file not found, checked %v and env STOCKBIT_TOKEN", TokenFileCandidates())
+		return nil, fmt.Errorf("token file not found, checked %v — save with: indostock auth save --token <JWT> --refresh <JWT>", TokenFileCandidates())
 	}
 	return LoadFrom(path)
 }
@@ -336,9 +329,73 @@ func jwtFromObj(parent map[string]any, key string) (token, expiredAt string) {
 	return "", ""
 }
 
+// journalRefreshResponse persists the raw refresh response body BEFORE any
+// parsing, into a timestamped journal. Stockbit rotates the refresh token on
+// every successful /login/refresh call — once the endpoint returns 200 the
+// old refresh token is dead server-side, so the response body is the ONLY
+// place the new pair exists. Keep the last 10 journals.
+func journalRefreshResponse(body []byte) string {
+	dir := tokenDir()
+	if dir == "" {
+		dir = "/tmp"
+	}
+	name := filepath.Join(dir, fmt.Sprintf("refresh_journal_%s.json", time.Now().UTC().Format("20060102T150405")))
+	if err := os.WriteFile(name, body, 0600); err != nil {
+		return ""
+	}
+	// keep last 10 journals
+	if matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json")); len(matches) > 10 {
+		sort.Strings(matches)
+		for _, old := range matches[:len(matches)-10] {
+			_ = os.Remove(old)
+		}
+	}
+	return name
+}
+
+func tokenDir() string {
+	if p := FindTokenFile(); p != "" {
+		return filepath.Dir(p)
+	}
+	return ""
+}
+
+// loadRefreshJournal returns the newest refresh journal entry (raw body).
+func loadRefreshJournal() ([]byte, string, error) {
+	dir := tokenDir()
+	if dir == "" {
+		return nil, "", fmt.Errorf("no token file location known yet")
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json"))
+	if len(matches) == 0 {
+		if last := filepath.Join(dir, "last_refresh_response.json"); fileExists(last) {
+			matches = []string{last}
+		} else {
+			return nil, "", fmt.Errorf("no refresh journal found in %s", dir)
+		}
+	}
+	sort.Strings(matches)
+	latest := matches[len(matches)-1]
+	b, err := os.ReadFile(latest)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, latest, nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
 func Refresh(t *StoredToken) (*StoredToken, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
+	}
+	// pre-flight: never spend the refresh call on a dead refresh token —
+	// a failed call is harmless, but a successful one RETIRES the token.
+	if rtExp := jwtExpiry(t.RefreshToken); !rtExp.IsZero() && rtExp.Before(time.Now()) {
+		return nil, fmt.Errorf("refresh token EXPIRED at %s — server login required (browser is source of truth, ADR-0009)", rtExp.Format(time.RFC3339))
 	}
 	req, err := http.NewRequest("POST", "https://exodus.stockbit.com/login/refresh", nil)
 	if err != nil {
@@ -363,16 +420,12 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		}
 		return nil, fmt.Errorf("refresh failed %d: %s", resp.StatusCode, string(body[:n]))
 	}
-	// dump raw response so a freshly-rotated token pair is never lost to a
-	// parser mismatch (Stockbit rotates refresh tokens on every use!)
+	// journal raw response BEFORE parsing so a freshly-rotated token pair is
+	// never lost to a parser mismatch (Stockbit rotates refresh tokens on
+	// every use — after HTTP 200 the old pair is already dead server-side)
 	body, _ := io.ReadAll(resp.Body)
-	dumpPath := FindTokenFile()
-	if dumpPath == "" {
-		dumpPath = "/tmp/indostock_refresh_resp.json"
-	} else {
-		dumpPath = filepath.Join(filepath.Dir(dumpPath), "last_refresh_response.json")
-	}
-	_ = os.WriteFile(dumpPath, body, 0600)
+	journal := journalRefreshResponse(body)
+	_ = os.WriteFile(filepath.Join(tokenDirOrTmp(), "last_refresh_response.json"), body, 0600)
 
 	// accept multiple known shapes for the rotated token pair
 	at, rt, atExp := extractTokens(body)
@@ -394,7 +447,17 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		}
 	}
 	if nt.AccessToken == "" {
-		return nil, fmt.Errorf("refresh returned empty access token")
+		return nil, fmt.Errorf("refresh returned empty access token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
+	}
+	// rotation sanity: new refresh token must differ and must not be expired
+	if rt == "" {
+		return nil, fmt.Errorf("refresh returned empty refresh token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
+	}
+	if rt == t.RefreshToken {
+		return nil, fmt.Errorf("refresh returned the SAME refresh token (rotation did not happen; refusing to overwrite — journal at %s)", journal)
+	}
+	if nExp := jwtExpiry(rt); !nExp.IsZero() && nExp.Before(time.Now()) {
+		return nil, fmt.Errorf("refresh returned an already-expired refresh token (exp %s) — journal at %s", nExp.Format(time.RFC3339), journal)
 	}
 	// prefer existing file location
 	path := FindTokenFile()
@@ -409,6 +472,13 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		}
 	}
 	return nt, nil
+}
+
+func tokenDirOrTmp() string {
+	if d := tokenDir(); d != "" {
+		return d
+	}
+	return "/tmp"
 }
 
 // ForceRefresh reloads current token and refreshes even if not expired, guarded by same lock.
@@ -561,6 +631,58 @@ func GetValidToken() (string, error) {
 	return t.AccessToken, nil
 }
 
+// Rescue recovers the newest journaled refresh response: parse it, validate
+// the pair, and save to file + secondary store. This is the escape hatch if
+// a future API shape change breaks extractTokens after a rotation.
+func Rescue() (*StoredToken, string, error) {
+	body, journal, err := loadRefreshJournal()
+	if err != nil {
+		return nil, "", err
+	}
+	at, rt, atExp := extractTokens(body)
+	if at == "" || rt == "" {
+		return nil, journal, fmt.Errorf("journal %s does not contain a parsable token pair (shape changed again? body len %d)", journal, len(body))
+	}
+	if exp := jwtExpiry(rt); !exp.IsZero() && exp.Before(time.Now()) {
+		return nil, journal, fmt.Errorf("journal %s refresh token already expired at %s — too late, browser login required", journal, exp.Format(time.RFC3339))
+	}
+	nt := &StoredToken{AccessToken: at, RefreshToken: rt}
+	if atExp != "" {
+		if ts, err := time.Parse(time.RFC3339, atExp); err == nil {
+			nt.ExpiresAt = ts.UTC()
+		}
+	}
+	if nt.ExpiresAt.IsZero() {
+		if exp := jwtExpiry(at); !exp.IsZero() {
+			nt.ExpiresAt = exp
+		}
+	}
+	// never downgrade: only save if journaled RT differs from current file RT
+	if cur, err := Load(); err == nil && cur != nil && cur.RefreshToken == rt {
+		return nt, journal, fmt.Errorf("journal is not newer than current token (same refresh token) — nothing to rescue")
+	}
+	path := FindTokenFile()
+	if path == "" {
+		path = TokenFileCandidates()[0]
+	}
+	if err := Save(nt, path); err != nil {
+		return nt, journal, err
+	}
+	if s := getSecondaryStore(); s != nil {
+		_ = s.Save(nt)
+	}
+	return nt, journal, nil
+}
+
+// RTBattery reports refresh-token health: expiry and remaining time.
+func RTBattery(t *StoredToken) (time.Time, time.Duration) {
+	exp := jwtExpiry(t.RefreshToken)
+	if exp.IsZero() {
+		return time.Time{}, 0
+	}
+	return exp, time.Until(exp)
+}
+
 func Status() map[string]any {
 	t, err := Load()
 	if err != nil {
@@ -571,7 +693,9 @@ func Status() map[string]any {
 	valid := !IsExpired(t, 0)
 	willRefresh := IsExpired(t, 5*time.Minute)
 	jwtExp := jwtExpiry(t.AccessToken)
-	return map[string]any{
+	rtExp, rtLeft := RTBattery(t)
+	// AT is considered "cache-healthy" only if some store still holds it
+	st := map[string]any{
 		"ok":                valid,
 		"has_refresh":       t.RefreshToken != "",
 		"expires_at":        exp.Format(time.RFC3339),
@@ -583,6 +707,31 @@ func Status() map[string]any {
 		"token_len":         len(t.AccessToken),
 		"refresh_len":       len(t.RefreshToken),
 	}
+	// refresh-token battery: the REAL health indicator (access tokens are
+	// disposable — the refresh token is the single source of truth)
+	if !rtExp.IsZero() {
+		st["rt_expires_at"] = rtExp.Format(time.RFC3339)
+		st["rt_remaining"] = rtLeft.String()
+		st["rt_days_left"] = math.Round(rtLeft.Hours()/24*10) / 10
+		// warning threshold: < 48h
+		st["rt_warning"] = rtLeft < 48*time.Hour
+		st["rt_dead"] = rtLeft <= 0
+	} else {
+		st["rt_warning"] = true
+		st["rt_dead"] = true
+	}
+	// last rotation info from journals
+	if dir := tokenDir(); dir != "" {
+		if matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json")); len(matches) > 0 {
+			sort.Strings(matches)
+			last := matches[len(matches)-1]
+			if fi, err := os.Stat(last); err == nil {
+				st["last_rotation_at"] = fi.ModTime().UTC().Format(time.RFC3339)
+				st["last_rotation_ago"] = time.Since(fi.ModTime()).String()
+			}
+		}
+	}
+	return st
 }
 
 const RedisKey = "indostock:auth:stockbit"

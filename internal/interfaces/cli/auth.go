@@ -26,6 +26,8 @@ func runAuth(rest []string) int {
 		return runAuthRefresh(args)
 	case "save", "login", "set":
 		return runAuthSave(args)
+	case "rescue":
+		return runAuthRescue(args)
 	case "help", "--help", "-h":
 		printAuthHelp()
 		return 0
@@ -43,6 +45,7 @@ Usage:
   indostock auth status [--json]              Show token expiry & refresh status
   indostock auth refresh [--json]             Force refresh via POST /login/refresh (needs refresh_token)
   indostock auth save --token <JWT> [--refresh <JWT>] [--file <path>] [--json]
+  indostock auth rescue [--compact]          Recover newest refresh journal into live store
      Save token from browser. One-time step, then auto-rotate daily.
   indostock auth save --stdin                 Read JSON from stdin: {"access_token": "...", "refresh_token": "..."}
 
@@ -129,14 +132,14 @@ func runAuthRefresh(args []string) int {
 		}
 	}
 	outputJSON(map[string]any{
-		"ok":           true,
-		"expires_at":   nt.ExpiresAt.Format(time.RFC3339),
-		"expires_in":   time.Until(nt.ExpiresAt).String(),
-		"file":         auth.FindTokenFile(),
-		"redis_key":    auth.RedisKey,
-		"token_len":    len(nt.AccessToken),
-		"refresh_len":  len(nt.RefreshToken),
-		"message":      "token refreshed and saved to file+redis, cron hourly will auto-rotate",
+		"ok":          true,
+		"expires_at":  nt.ExpiresAt.Format(time.RFC3339),
+		"expires_in":  time.Until(nt.ExpiresAt).String(),
+		"file":        auth.FindTokenFile(),
+		"redis_key":   auth.RedisKey,
+		"token_len":   len(nt.AccessToken),
+		"refresh_len": len(nt.RefreshToken),
+		"message":     "token refreshed and saved to file+redis, cron hourly will auto-rotate",
 	}, compact)
 	return 0
 }
@@ -234,11 +237,50 @@ func runAuthSave(args []string) int {
 		expStr = saved.ExpiresAt.Format(time.RFC3339)
 	}
 	outputJSON(map[string]any{
-		"ok":         true,
-		"file":       auth.FindTokenFile(),
-		"expires_at": expStr,
+		"ok":          true,
+		"file":        auth.FindTokenFile(),
+		"expires_at":  expStr,
 		"has_refresh": refresh != "",
-		"message":    "saved. test: indostock auth status --json && indostock orderbook BBCA --depth 2 --json",
+		"message":     "saved. test: indostock auth status --json && indostock orderbook BBCA --depth 2 --json",
 	}, compact)
 	return 0
+}
+
+// runAuthRescue recovers the newest journaled refresh response into the live
+// token store. Escape hatch when a rotation succeeded server-side but the
+// parser failed client-side (the 2026-09-12 incident).
+func runAuthRescue(args []string) int {
+	compact := sliceContains(args, "--compact")
+	nt, journal, err := auth.Rescue()
+	out := map[string]any{"journal": journal}
+	if err != nil {
+		out["ok"] = false
+		out["error"] = err.Error()
+		if nt != nil && nt.AccessToken != "" {
+			out["recovered_access"] = true
+		}
+		outputJSON(out, compact)
+		return 1
+	}
+	// sync to redis
+	cfg2 := config.Load()
+	rc := cache.New(cfg2.RedisURL)
+	if rc.Available() {
+		_ = auth.SaveToRedis(rc, nt)
+	}
+	out["ok"] = true
+	out["expires_at"] = nt.ExpiresAt.Format(time.RFC3339)
+	out["has_refresh"] = nt.RefreshToken != ""
+	out["message"] = "rescued from journal. test: indostock auth status --json && indostock orderbook BBCA --depth 2 --json"
+	outputJSON(out, compact)
+	return 0
+}
+
+func sliceContains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
