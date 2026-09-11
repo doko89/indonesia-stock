@@ -397,6 +397,36 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 	if rtExp := jwtExpiry(t.RefreshToken); !rtExp.IsZero() && rtExp.Before(time.Now()) {
 		return nil, fmt.Errorf("refresh token EXPIRED at %s — server login required (browser is source of truth, ADR-0009)", rtExp.Format(time.RFC3339))
 	}
+	// single-writer lock INSIDE Refresh(): every trigger path (cron, serve
+	// startup, CLI, on-demand 401 retry) is serialized here. Without this,
+	// two concurrent refreshers can both get HTTP 200 and fork the token
+	// lineage — one of the two new pairs is silently invalid server-side.
+	locked, release := acquireRefreshLock()
+	if !locked {
+		// someone else is rotating right now: poll for their result
+		for i := 0; i < 12; i++ {
+			time.Sleep(500 * time.Millisecond)
+			if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" && cur.RefreshToken != t.RefreshToken {
+				return cur, nil // peer's rotation produced a new pair; adopt it
+			}
+			if locked, r2 := acquireRefreshLock(); locked {
+				release = r2
+				break
+			}
+		}
+		if !locked {
+			return nil, fmt.Errorf("could not acquire refresh lock — another rotation is stuck?")
+		}
+		// got the lock after waiting: reload freshest before rotating
+		if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" {
+			if cur.RefreshToken != t.RefreshToken {
+				release()
+				return cur, nil // peer rotated while we waited
+			}
+			t = cur
+		}
+	}
+	defer release()
 	req, err := http.NewRequest("POST", "https://exodus.stockbit.com/login/refresh", nil)
 	if err != nil {
 		return nil, err
@@ -490,25 +520,9 @@ func ForceRefresh() (string, error) {
 	if t.RefreshToken == "" {
 		return "", fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
 	}
-	locked, release := acquireRefreshLock()
-	if !locked {
-		// wait polling for lock
-		for i := 0; i < 10; i++ {
-			time.Sleep(500 * time.Millisecond)
-			locked, release = acquireRefreshLock()
-			if locked {
-				break
-			}
-		}
-		if !locked {
-			return "", fmt.Errorf("could not acquire refresh lock after waiting")
-		}
-	}
-	defer release()
-	// reload after acquiring lock to get freshest token
-	if nt, err := loadBestToken(); err == nil && nt.RefreshToken != "" {
-		t = nt
-	}
+	// Refresh() acquires the single-writer lock internally now — do NOT
+	// double-lock here (the Redis lock is not reentrant; nesting caused a
+	// self-deadlock until the 15s lock TTL rescued us).
 	nt, err := Refresh(t)
 	if err != nil {
 		return "", err
@@ -563,66 +577,14 @@ func GetValidToken() (string, error) {
 	}
 	if IsExpired(t, 5*time.Minute) {
 		if t.RefreshToken != "" {
-			locked, release := acquireRefreshLock()
-			if locked {
-				defer release()
-				// reload after acquiring: a peer may have rotated just before us
-				src := t
-				if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" {
-					if !IsExpired(cur, 5*time.Minute) {
-						return cur.AccessToken, nil
-					}
-					src = cur
-				}
-				nt, err := Refresh(src)
-				if err != nil {
-					return "", fmt.Errorf("auto-refresh failed: %w", err)
-				}
-				return nt.AccessToken, nil
+			// Refresh() acquires the single-writer lock internally and adopts
+			// a peer's fresh pair if one appears while we wait — no outer
+			// locking here (non-reentrant lock = self-deadlock).
+			nt, err := Refresh(t)
+			if err != nil {
+				return "", fmt.Errorf("auto-refresh failed: %w", err)
 			}
-			// lock not acquired: wait up to ~5s polling Load() (secondary first, then file) every 500ms
-			for i := 0; i < 10; i++ {
-				time.Sleep(500 * time.Millisecond)
-				// try secondary store first
-				if s := getSecondaryStore(); s != nil {
-					if nt, err := s.Load(); err == nil && nt != nil && !IsExpired(nt, 5*time.Minute) {
-						return nt.AccessToken, nil
-					}
-				}
-				if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
-					return nt.AccessToken, nil
-				}
-			}
-			// after polling, try to acquire lock again and refresh with freshly loaded token
-			locked2, release2 := acquireRefreshLock()
-			if locked2 {
-				defer release2()
-				// reload latest token before refreshing (Fix 1: use nt not t)
-				if nt, err := loadBestToken(); err == nil && nt != nil && nt.RefreshToken != "" {
-					// if nt is still expired, refresh nt
-					if IsExpired(nt, 5*time.Minute) {
-						refreshed, err := Refresh(nt)
-						if err == nil {
-							return refreshed.AccessToken, nil
-						}
-						return "", fmt.Errorf("auto-refresh failed: %w", err)
-					}
-					return nt.AccessToken, nil
-				}
-				// never Refresh(t) with the pre-wait token: its refresh token may
-				// have been retired by the peer's rotation. Without a freshly
-				// loaded refreshable token there is nothing safe to rotate with.
-				return "", fmt.Errorf("auto-refresh failed: could not reload a refreshable token")
-			}
-			// still no lock: try one final load
-			if s := getSecondaryStore(); s != nil {
-				if nt, err := s.Load(); err == nil && nt != nil && !IsExpired(nt, 5*time.Minute) {
-					return nt.AccessToken, nil
-				}
-			}
-			if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
-				return nt.AccessToken, nil
-			}
+			return nt.AccessToken, nil
 		}
 		if IsExpired(t, 0) {
 			return "", fmt.Errorf("token expired at %s and no refresh_token, re-login via browser required", t.ExpiresAt.Format(time.RFC3339))

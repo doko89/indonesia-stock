@@ -167,49 +167,20 @@ func Load() Config {
 	redisURL := env("REDIS_URL", "redis://localhost:6379/0")
 	rc := ensureAuthWiring(redisURL)
 
-	envToken := env("STOCKBIT_TOKEN", "")
-	envRefresh := strings.TrimSpace(os.Getenv("STOCKBIT_REFRESH_TOKEN"))
-
-	// stored candidate with a refresh token (redis first, then file),
-	// loaded without env shadowing so auto-refresh keeps working.
-	var stored *auth.StoredToken
-	if rc != nil {
-		if t, err := auth.LoadFromRedis(rc); err == nil && t != nil && t.RefreshToken != "" {
-			stored = t
-		}
-	}
-	if stored == nil {
-		if p := auth.FindTokenFile(); p != "" {
-			if t, err := auth.LoadFrom(p); err == nil && t.RefreshToken != "" {
-				stored = t
-			}
-		}
-	}
-
+	// NOTE: env STOCKBIT_TOKEN is deliberately IGNORED here too.
+	// token.json is the single source of truth; env shadowing burned the
+	// live token twice (2026-09-02, 2026-09-12). Read path: file, with
+	// auto-rotate via GetValidToken (lock-serialized inside Refresh).
 	var token string
-	if envToken != "" && envRefresh == "" && stored != nil && stored.RefreshToken != "" {
-		token = stored.AccessToken
-		if auth.IsExpired(stored, 5*time.Minute) {
-			if v, err := auth.ForceRefresh(); err == nil && v != "" {
-				token = v
-			} else if auth.IsExpired(stored, 0) {
-				// stored is expired and cannot be rotated: fall back to env.
-				token = envToken
-			}
+	if t, err := auth.Load(); err == nil && t.AccessToken != "" {
+		if v, err := auth.GetValidToken(); err == nil {
+			token = v
+		} else {
+			token = t.AccessToken
 		}
-	} else if envToken != "" {
-		token = envToken
-	} else {
-		if t, err := auth.Load(); err == nil && t.AccessToken != "" {
-			if v, err := auth.GetValidToken(); err == nil {
-				token = v
-			} else {
-				token = t.AccessToken
-			}
-		}
-		if token == "" {
-			token = tokenFromFile()
-		}
+	}
+	if token == "" {
+		token = tokenFromFile()
 	}
 
 	return Config{

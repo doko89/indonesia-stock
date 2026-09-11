@@ -329,6 +329,17 @@ func runHistory(cfg config.Config, rest []string) int {
 	return 0
 }
 
+// srcName reports which store the startup session came from.
+func srcName(fileTok, redisTok *auth.StoredToken) string {
+	if fileTok != nil {
+		return "token.json"
+	}
+	if redisTok != nil {
+		return "redis"
+	}
+	return "none"
+}
+
 func runOrderbook(cfg config.Config, rest []string) int {
 	symbol, flags, compact, _, _ := parseFlags(rest, map[string]string{"interval": "2", "depth": "10"})
 	if symbol == "" {
@@ -1143,21 +1154,37 @@ func runServe(cfg config.Config, rest []string) int {
 	// Redis session: saat start cek redis, jika valid pakai, jika hampir expired rotate via refresh
 	rc := cache.New(cfg.RedisURL)
 	if rc.Available() {
-		if t, err := auth.LoadFromRedis(rc); err == nil && t.AccessToken != "" {
-			if !auth.IsExpired(t, 5*time.Minute) {
-				fmt.Fprintf(os.Stderr, "redis: session valid expires=%s remaining=%v\n", t.ExpiresAt.Format(time.RFC3339), time.Until(t.ExpiresAt).Round(time.Second))
-			} else if t.RefreshToken != "" {
-				fmt.Fprintln(os.Stderr, "redis: session hampir expired, rotate...")
-				if nt, err := auth.Refresh(t); err == nil {
+		// prefer token.json (single source of truth); Redis cache only helps
+		// if the file is unreadable. Rotation itself is lock-serialized
+		// inside auth.Refresh().
+		tf := auth.FindTokenFile()
+		var tfTok *auth.StoredToken
+		if tf != "" {
+			if tt, err := auth.LoadFrom(tf); err == nil && tt.AccessToken != "" {
+				tfTok = tt
+			}
+		}
+		rt, _ := auth.LoadFromRedis(rc)
+		src := tfTok
+		if src == nil {
+			src = rt
+		}
+		if src != nil && src.AccessToken != "" {
+			if !auth.IsExpired(src, 5*time.Minute) {
+				fmt.Fprintf(os.Stderr, "session valid expires=%s remaining=%v (src=%s)\n", src.ExpiresAt.Format(time.RFC3339), time.Until(src.ExpiresAt).Round(time.Second), srcName(tfTok, rt))
+			} else if src.RefreshToken != "" {
+				fmt.Fprintln(os.Stderr, "session hampir expired, rotate...")
+				if nt, err := auth.Refresh(src); err == nil {
 					_ = auth.SaveToRedis(rc, nt)
 					_ = auth.Save(nt, "")
-					fmt.Fprintf(os.Stderr, "redis: rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
+					fmt.Fprintf(os.Stderr, "rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
 				} else {
-					fmt.Fprintf(os.Stderr, "redis: rotate gagal: %v\n", err)
+					fmt.Fprintf(os.Stderr, "rotate gagal: %v\n", err)
 				}
 			} else {
-				fmt.Fprintln(os.Stderr, "redis: session expired tanpa refresh_token, butuh indostock auth save")
+				fmt.Fprintln(os.Stderr, "session expired tanpa refresh_token, butuh indostock auth save")
 			}
+		}
 		} else {
 			if t, err := auth.Load(); err == nil && t.AccessToken != "" {
 				_ = auth.SaveToRedis(rc, t)
@@ -1175,11 +1202,30 @@ func runServe(cfg config.Config, rest []string) int {
 	c := cron.New(cron.WithLocation(wib))
 	_, _ = c.AddFunc("0 * * * *", func() {
 		rc2 := cache.New(cfg.RedisURL)
-		if !rc2.Available() {
-			return
+		// source of truth is token.json; Redis is only a read cache.
+		// If the Redis key expired (e.g. service down > 24h) we MUST fall
+		// back to the file — otherwise the healthy refresh token in the
+		// file quietly rots to death while cron "returns" every hour.
+		var t *auth.StoredToken
+		if rc2.Available() {
+			if tt, err := auth.LoadFromRedis(rc2); err == nil && tt != nil && tt.RefreshToken != "" {
+				t = tt
+			}
 		}
-		t, err := auth.LoadFromRedis(rc2)
-		if err != nil || t.RefreshToken == "" {
+		if t == nil {
+			if p := auth.FindTokenFile(); p != "" {
+				if tt, err := auth.LoadFrom(p); err == nil && tt != nil && tt.RefreshToken != "" {
+					t = tt
+					log.Printf("cron: redis key missing/expired, using token.json (rt until %s)", func() string {
+						if e := auth.RTBattery(tt); !e.IsZero() {
+							return e.Format(time.RFC3339)
+						}
+						return "unknown"
+					}())
+				}
+			}
+		}
+		if t == nil {
 			return
 		}
 		if auth.IsExpired(t, 30*time.Minute) {
