@@ -292,6 +292,14 @@ func extractTokens(body []byte) (string, string, string) {
 			}
 		}
 	}
+	// shape 5 (actual exodus /login/refresh): data.access.token + data.refresh.token
+	if d, ok := raw["data"].(map[string]any); ok {
+		at, atExp := jwtFromObj(d, "access")
+		rt, _ := jwtFromObj(d, "refresh")
+		if at != "" {
+			return at, rt, atExp
+		}
+	}
 	// shape 3: data.access_token / data.refresh_token
 	if d, ok := raw["data"].(map[string]any); ok {
 		at, _ := d["access_token"].(string)
