@@ -46,7 +46,11 @@ func (c *Client) GetOrderbook(ctx context.Context, symbol string) (*orderbook.Or
 		if err == nil {
 			return ob, nil
 		}
-		if i == 0 && (status == http.StatusUnauthorized || status == http.StatusForbidden) && c.OnAuthRejected != nil {
+		// auth rejection: explicit 401/403, OR Stockbit's sneaky 200 +
+		// InvalidParameter "Silahkan update aplikasi" (token rejected)
+		authRejected := status == http.StatusUnauthorized || status == http.StatusForbidden ||
+			strings.Contains(err.Error(), "Silahkan update aplikasi")
+		if i == 0 && authRejected && c.OnAuthRejected != nil {
 			if fresh := c.OnAuthRejected(); fresh != "" {
 				c.token = fresh
 				if ob2, _, err2 := c.fetch(ctx, url, symbol); err2 == nil {

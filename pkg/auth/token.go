@@ -267,6 +267,67 @@ type refreshResp struct {
 	} `json:"data"`
 }
 
+// extractTokens pulls the rotated access/refresh token pair out of a refresh
+// response body, tolerating multiple API shapes:
+//  1. {"data":{"refresh":{"access":{"token":...,"expired_at":...},"refresh":{"token":...}}}}
+//  2. {"data":{"token_data":{"access":{"token":...,"expired_at":...},"refresh":{"token":...}}}}
+//  3. {"data":{"access_token":...,"refresh_token":...}}
+//  4. {"access_token":...,"refresh_token":...}
+//
+// Returns (access, refresh, accessExpiredAtRFC3339).
+func extractTokens(body []byte) (string, string, string) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", "", ""
+	}
+	// shape 1 & 2: nested token_data/refresh objects
+	for _, mid := range []string{"refresh", "token_data"} {
+		if d, ok := raw["data"].(map[string]any); ok {
+			if td, ok := d[mid].(map[string]any); ok {
+				at, atExp := jwtFromObj(td, "access")
+				rt, _ := jwtFromObj(td, "refresh")
+				if at != "" {
+					return at, rt, atExp
+				}
+			}
+		}
+	}
+	// shape 3: data.access_token / data.refresh_token
+	if d, ok := raw["data"].(map[string]any); ok {
+		at, _ := d["access_token"].(string)
+		rt, _ := d["refresh_token"].(string)
+		if at != "" {
+			return at, rt, ""
+		}
+	}
+	// shape 4: flat
+	at, _ := raw["access_token"].(string)
+	rt, _ := raw["refresh_token"].(string)
+	if at != "" {
+		return at, rt, ""
+	}
+	return "", "", ""
+}
+
+func jwtFromObj(parent map[string]any, key string) (token, expiredAt string) {
+	o, ok := parent[key].(map[string]any)
+	if !ok {
+		// sometimes the value is the raw token string itself
+		if s, ok := parent[key].(string); ok && strings.Count(s, ".") == 2 {
+			return s, ""
+		}
+		return "", ""
+	}
+	if t, ok := o["token"].(string); ok {
+		e, _ := o["expired_at"].(string)
+		if e == "" {
+			e, _ = o["expires_at"].(string)
+		}
+		return t, e
+	}
+	return "", ""
+}
+
 func Refresh(t *StoredToken) (*StoredToken, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
@@ -294,17 +355,26 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		}
 		return nil, fmt.Errorf("refresh failed %d: %s", resp.StatusCode, string(body[:n]))
 	}
-	var rr refreshResp
-	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
-		return nil, fmt.Errorf("decode refresh: %w", err)
+	// dump raw response so a freshly-rotated token pair is never lost to a
+	// parser mismatch (Stockbit rotates refresh tokens on every use!)
+	body, _ := io.ReadAll(resp.Body)
+	dumpPath := FindTokenFile()
+	if dumpPath == "" {
+		dumpPath = "/tmp/indostock_refresh_resp.json"
+	} else {
+		dumpPath = filepath.Join(filepath.Dir(dumpPath), "last_refresh_response.json")
 	}
+	_ = os.WriteFile(dumpPath, body, 0600)
+
+	// accept multiple known shapes for the rotated token pair
+	at, rt, atExp := extractTokens(body)
 	nt := &StoredToken{
-		AccessToken:  rr.Data.Refresh.Access.Token,
-		RefreshToken: rr.Data.Refresh.Refresh.Token,
+		AccessToken:  at,
+		RefreshToken: rt,
 		UserID:       t.UserID,
 	}
-	if rr.Data.Refresh.Access.ExpiredAt != "" {
-		if ts, err := time.Parse(time.RFC3339, rr.Data.Refresh.Access.ExpiredAt); err == nil {
+	if atExp != "" {
+		if ts, err := time.Parse(time.RFC3339, atExp); err == nil {
 			nt.ExpiresAt = ts.UTC()
 		}
 	}
