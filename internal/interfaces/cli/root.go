@@ -1184,8 +1184,8 @@ func runServe(cfg config.Config, rest []string) int {
 			} else {
 				fmt.Fprintln(os.Stderr, "session expired tanpa refresh_token, butuh indostock auth save")
 			}
-		}
-		} else {
+		} else if tfTok == nil {
+			// nothing usable anywhere: seed redis from file if it has AT only
 			if t, err := auth.Load(); err == nil && t.AccessToken != "" {
 				_ = auth.SaveToRedis(rc, t)
 				fmt.Fprintf(os.Stderr, "redis: seeded dari file expires=%s\n", t.ExpiresAt.Format(time.RFC3339))
@@ -1217,7 +1217,7 @@ func runServe(cfg config.Config, rest []string) int {
 				if tt, err := auth.LoadFrom(p); err == nil && tt != nil && tt.RefreshToken != "" {
 					t = tt
 					log.Printf("cron: redis key missing/expired, using token.json (rt until %s)", func() string {
-						if e := auth.RTBattery(tt); !e.IsZero() {
+						if e, _ := auth.RTBattery(tt); !e.IsZero() {
 							return e.Format(time.RFC3339)
 						}
 						return "unknown"
