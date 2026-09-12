@@ -3,7 +3,7 @@ package financial
 type Period string
 
 const (
-	PeriodAnnual   Period = "annual"
+	PeriodAnnual    Period = "annual"
 	PeriodQuarterly Period = "quarterly"
 )
 
@@ -16,14 +16,14 @@ const (
 )
 
 type Report struct {
-	StockCode string     `json:"stock_code"`
-	Period    Period     `json:"period"`
-	Type      ReportType `json:"type"`
-	Years     []int      `json:"years"`
-	Quarters  []int      `json:"quarters,omitempty"`
+	StockCode string         `json:"stock_code"`
+	Period    Period         `json:"period"`
+	Type      ReportType     `json:"type"`
+	Years     []int          `json:"years"`
+	Quarters  []int          `json:"quarters,omitempty"`
 	Data      map[string]any `json:"data"`
-	Source    string     `json:"source"`
-	Currency  string     `json:"currency,omitempty"`
+	Source    string         `json:"source"`
+	Currency  string         `json:"currency,omitempty"`
 }
 
 type GeneralInfo struct {
@@ -38,12 +38,12 @@ type GeneralInfo struct {
 }
 
 type XBRLReport struct {
-	StockCode      string         `json:"stock_code"`
-	Year           int            `json:"year"`
-	Quarter        int            `json:"quarter"`
-	GeneralInfo    map[string]string `json:"general_info"`
-	BalanceSheet   map[string]float64 `json:"balance_sheet"`
+	StockCode       string             `json:"stock_code"`
+	Year            int                `json:"year"`
+	Quarter         int                `json:"quarter"`
+	GeneralInfo     map[string]string  `json:"general_info"`
+	BalanceSheet    map[string]float64 `json:"balance_sheet"`
 	IncomeStatement map[string]float64 `json:"income_statement,omitempty"`
-	CashFlow       map[string]float64 `json:"cash_flow,omitempty"`
-	Source         string         `json:"source"`
+	CashFlow        map[string]float64 `json:"cash_flow,omitempty"`
+	Source          string             `json:"source"`
 }

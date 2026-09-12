@@ -165,7 +165,7 @@ func (l *redisLocker) Unlock(id string) {
 
 func Load() Config {
 	redisURL := env("REDIS_URL", "redis://localhost:6379/0")
-	rc := ensureAuthWiring(redisURL)
+	_ = ensureAuthWiring(redisURL) // wires locker + redis store into pkg/auth
 
 	// NOTE: env STOCKBIT_TOKEN is deliberately IGNORED here too.
 	// token.json is the single source of truth; env shadowing burned the

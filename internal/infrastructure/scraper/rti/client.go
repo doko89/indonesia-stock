@@ -120,11 +120,11 @@ func parseRTIHTML(html, code string, period financial.Period, reportType financi
 		rep.Data["total_operating_expenses"] = getValues(html, "r8c", n)
 		rep.Data["operating_income"] = getValues(html, "r9c", n)
 		rep.Data["other_income_and_expenses"] = map[string]any{
-			"interest_income":            getValues(html, "r10c", n),
-			"interest_expense":           getValues(html, "r11c", n),
-			"foreign_exchange_gain_loss": getValues(html, "r12c", n),
+			"interest_income":             getValues(html, "r10c", n),
+			"interest_expense":            getValues(html, "r11c", n),
+			"foreign_exchange_gain_loss":  getValues(html, "r12c", n),
 			"gain_loss_on_sale_of_assets": getValues(html, "r13c", n),
-			"other_items":                getValues(html, "r14c", n),
+			"other_items":                 getValues(html, "r14c", n),
 		}
 		rep.Data["total_other_income_and_expenses"] = getValues(html, "r15c", n)
 		rep.Data["income_before_tax"] = getValues(html, "r16c", n)
@@ -140,7 +140,7 @@ func parseRTIHTML(html, code string, period financial.Period, reportType financi
 		rep.Data["earning_per_share"] = getValues(html, "r25c", n)
 		rep.Data["diluted_earnings_per_share"] = getValues(html, "r26c", n)
 		rep.Data["comprehensive_income"] = map[string]any{
-			"net_income":               getValues(html, "r27c", n),
+			"net_income":                 getValues(html, "r27c", n),
 			"other_comprehensive_income": getValues(html, "r28c", n),
 		}
 		rep.Data["total_comprehensive_income"] = getValues(html, "r29c", n)
@@ -177,19 +177,19 @@ func parseRTIHTML(html, code string, period financial.Period, reportType financi
 		rep.Data["total_liabilities"] = getValues(html, "r21c", n)
 		rep.Data["minority_interest"] = getValues(html, "r22c", n)
 		rep.Data["stockholders_equity"] = map[string]any{
-			"common_stock":                               getValues(html, "r23c", n),
-			"paid_in_capital":                            getValues(html, "r24c", n),
-			"retained_earnings_(deficit)":                getValues(html, "r25c", n),
-			"other_stockholders_equity":                  getValues(html, "r26c", n),
+			"common_stock":                              getValues(html, "r23c", n),
+			"paid_in_capital":                           getValues(html, "r24c", n),
+			"retained_earnings_(deficit)":               getValues(html, "r25c", n),
+			"other_stockholders_equity":                 getValues(html, "r26c", n),
 			"non_controlling_interest_(effective_2011)": getValues(html, "r27c", n),
 		}
 		rep.Data["total_stockholders_equity"] = getValues(html, "r28c", n)
 		rep.Data["total_liabilities_and_stockholders_equity"] = getValues(html, "r29c", n)
 	case financial.TypeCashFlow:
 		rep.Data["operating_activities"] = map[string]any{
-			"cash_from_customers":             getValues(html, "r2c", n),
+			"cash_from_customers":               getValues(html, "r2c", n),
 			"payments_for_operating_activities": getValues(html, "r3c", n),
-			"other_operating_activities":      getValues(html, "r4c", n),
+			"other_operating_activities":        getValues(html, "r4c", n),
 		}
 		rep.Data["cash_flow_from_operating_activities"] = getValues(html, "r5c", n)
 		rep.Data["investing_activities"] = map[string]any{
@@ -198,10 +198,10 @@ func parseRTIHTML(html, code string, period financial.Period, reportType financi
 		}
 		rep.Data["cash_flow_from_investing_activities"] = getValues(html, "r8c", n)
 		rep.Data["financing_activities"] = map[string]any{
-			"additional_paid_in_capital":         getValues(html, "r9c", n),
+			"additional_paid_in_capital":           getValues(html, "r9c", n),
 			"financing_activities_(related_party)": getValues(html, "r10c", n),
-			"dividends_paid":                     getValues(html, "r11c", n),
-			"other_financing_activities":         getValues(html, "r12c", n),
+			"dividends_paid":                       getValues(html, "r11c", n),
+			"other_financing_activities":           getValues(html, "r12c", n),
 		}
 		rep.Data["cash_flow_from_financing_activities"] = getValues(html, "r13c", n)
 		rep.Data["net_increase_decrease_in_cash_flow"] = getValues(html, "r14c", n)
@@ -372,11 +372,11 @@ func mockReport(code string, period financial.Period, t financial.ReportType) *f
 		data["total_operating_expenses"] = gen(6e11)
 		data["operating_income"] = gen(1.2e12)
 		data["other_income_and_expenses"] = map[string]any{
-			"interest_income":            gen(5e10),
-			"interest_expense":           gen(-8e10),
-			"foreign_exchange_gain_loss": genSmall(5e9),
+			"interest_income":             gen(5e10),
+			"interest_expense":            gen(-8e10),
+			"foreign_exchange_gain_loss":  genSmall(5e9),
 			"gain_loss_on_sale_of_assets": genSmall(2e9),
-			"other_items":                genSmall(1e10),
+			"other_items":                 genSmall(1e10),
 		}
 		data["total_other_income_and_expenses"] = genSmall(1e10)
 		data["income_before_tax"] = gen(1e12)
@@ -392,7 +392,7 @@ func mockReport(code string, period financial.Period, t financial.ReportType) *f
 		data["earning_per_share"] = genSmall(120)
 		data["diluted_earnings_per_share"] = genSmall(118)
 		data["comprehensive_income"] = map[string]any{
-			"net_income":               gen(8e11),
+			"net_income":                 gen(8e11),
 			"other_comprehensive_income": genSmall(5e10),
 		}
 		data["total_comprehensive_income"] = gen(8.5e11)
@@ -425,19 +425,19 @@ func mockReport(code string, period financial.Period, t financial.ReportType) *f
 		data["total_liabilities"] = gen(3e12)
 		data["minority_interest"] = genSmall(1e11)
 		data["stockholders_equity"] = map[string]any{
-			"common_stock":                               gen(5e11),
-			"paid_in_capital":                            gen(8e11),
-			"retained_earnings_(deficit)":                gen(3e12),
-			"other_stockholders_equity":                  genSmall(5e10),
+			"common_stock":                              gen(5e11),
+			"paid_in_capital":                           gen(8e11),
+			"retained_earnings_(deficit)":               gen(3e12),
+			"other_stockholders_equity":                 genSmall(5e10),
 			"non_controlling_interest_(effective_2011)": genSmall(2e11),
 		}
 		data["total_stockholders_equity"] = gen(5e12)
 		data["total_liabilities_and_stockholders_equity"] = gen(8e12)
 	case financial.TypeCashFlow:
 		data["operating_activities"] = map[string]any{
-			"cash_from_customers": gen(5e12),
+			"cash_from_customers":               gen(5e12),
 			"payments_for_operating_activities": gen(3e12),
-			"other_operating_activities":      genSmall(1e11),
+			"other_operating_activities":        genSmall(1e11),
 		}
 		data["cash_flow_from_operating_activities"] = gen(1.2e12)
 		data["investing_activities"] = map[string]any{
@@ -446,10 +446,10 @@ func mockReport(code string, period financial.Period, t financial.ReportType) *f
 		}
 		data["cash_flow_from_investing_activities"] = gen(-4e11)
 		data["financing_activities"] = map[string]any{
-			"additional_paid_in_capital":         genSmall(1e11),
+			"additional_paid_in_capital":           genSmall(1e11),
 			"financing_activities_(related_party)": genSmall(5e10),
-			"dividends_paid":                     gen(-2e11),
-			"other_financing_activities":         genSmall(-5e10),
+			"dividends_paid":                       gen(-2e11),
+			"other_financing_activities":           genSmall(-5e10),
 		}
 		data["cash_flow_from_financing_activities"] = gen(-3e11)
 		data["net_increase_decrease_in_cash_flow"] = genSmall(5e11)

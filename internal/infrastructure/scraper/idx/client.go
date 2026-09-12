@@ -190,12 +190,12 @@ func mockXBRLReport(code string, year, quarter int) *financial.XBRLReport {
 		Year:      year,
 		Quarter:   quarter,
 		GeneralInfo: map[string]string{
-			"entity_name": code + " Tbk",
-			"period":      fmt.Sprintf("Q%d %d", quarter, year),
-			"currency":    "IDR",
+			"entity_name":  code + " Tbk",
+			"period":       fmt.Sprintf("Q%d %d", quarter, year),
+			"currency":     "IDR",
 			"listed_since": "1990-01-01",
-			"address": "Jakarta, Indonesia",
-			"note": "mock: IDX live requires network; synthetic for offline AI testing",
+			"address":      "Jakarta, Indonesia",
+			"note":         "mock: IDX live requires network; synthetic for offline AI testing",
 			"income_statement_not_implemented_in_original": "true (original Python had pass)",
 		},
 		BalanceSheet: map[string]float64{

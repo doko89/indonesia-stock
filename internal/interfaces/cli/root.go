@@ -16,6 +16,7 @@ import (
 	"indonesia-stock/internal/infrastructure/cache"
 	"indonesia-stock/internal/infrastructure/scraper/idx"
 	"indonesia-stock/internal/infrastructure/scraper/rti"
+	sa "indonesia-stock/internal/infrastructure/scraper/stockanalysis"
 	"indonesia-stock/internal/infrastructure/scraper/stockbit"
 	"indonesia-stock/internal/infrastructure/scraper/yahoo"
 	"indonesia-stock/pkg/auth"
@@ -52,6 +53,8 @@ func Run(args []string) int {
 		return runHistory(cfg, rest)
 	case "orderbook", "ob", "book":
 		return runOrderbook(cfg, rest)
+	case "fundamentals", "fundas", "val":
+		return runFundamentals(cfg, rest)
 	case "financial", "fundamental", "report":
 		return runFinancial(cfg, rest)
 	case "idx", "xbrl", "idx_xbrl":
@@ -338,6 +341,98 @@ func srcName(fileTok, redisTok *auth.StoredToken) string {
 		return "redis"
 	}
 	return "none"
+}
+
+// runFundamentals fetches fundamental metrics for IDX symbols from
+// stockanalysis.com (S&P Global data), cached 24h in Redis.
+//
+//	indostock fundamentals BBCA [--compact|--json]
+//	indostock fundamentals BBCA BBRI TLKM
+//	INDOSTOCK_NO_CACHE=1 indostock fundamentals BBCA   (bypass cache)
+func runFundamentals(cfg config.Config, rest []string) int {
+	syms := make([]string, 0, 4)
+	compact := false
+	for _, a := range rest {
+		switch {
+		case a == "--compact" || a == "--json" || a == "-c":
+			compact = true
+		case strings.HasPrefix(a, "--"):
+			// ignore unknown flags silently (parseFlags-compatible)
+		default:
+			if !strings.HasPrefix(a, "-") {
+				syms = append(syms, strings.ToUpper(strings.TrimSpace(a)))
+			}
+		}
+	}
+	if len(syms) == 0 {
+		fmt.Fprintln(os.Stderr, "fundamentals: need SYMBOL, e.g. indostock fundamentals BBCA")
+		return 1
+	}
+	noCache := os.Getenv("INDOSTOCK_NO_CACHE") == "1"
+	client := sa.New()
+	rc := cache.New(cfg.RedisURL)
+	rcOK := rc.Available() && !noCache
+
+	exit := 0
+	for _, sym := range syms {
+		key := "indostock:fundamentals:" + sym
+		if rcOK {
+			if raw, gerr := rc.Get(key); gerr == nil && raw != "" {
+				f := &sa.Fundamentals{}
+				if jerr := json.Unmarshal([]byte(raw), f); jerr == nil && f.PE != "" {
+					if compact {
+						fmt.Println(raw)
+					} else {
+						printFundamentals(f)
+					}
+					continue
+				}
+			}
+		}
+		f, err := client.FetchStatistics(sym)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "fundamentals %s: %v\n", sym, err)
+			exit = 1
+			continue
+		}
+		if rcOK {
+			if b, jerr := json.Marshal(f); jerr == nil {
+				_ = rc.SetEx(key, string(b), 24*time.Hour)
+			}
+		}
+		if compact {
+			b, _ := json.Marshal(f)
+			fmt.Println(string(b))
+		} else {
+			printFundamentals(f)
+		}
+	}
+	return exit
+}
+
+func printFundamentals(f *sa.Fundamentals) {
+	fmt.Printf("%s  (per %s, sumber %s)\n", f.Symbol, f.AsOf, f.Source)
+	rows := []struct{ k, v string }{
+		{"PE / Fwd PE", strings.TrimSpace(f.PE + " / " + f.PEForward)},
+		{"PBV / PEG", strings.TrimSpace(f.PBV + " / " + f.PEG)},
+		{"ROE / ROA", strings.TrimSpace(f.ROE + " / " + f.ROA)},
+		{"Margin (op/profit)", strings.TrimSpace(f.OpMargin + " / " + f.ProfMargin)},
+		{"EPS TTM", f.EPS},
+		{"Revenue TTM", f.Revenue},
+		{"Net Income TTM", f.NetIncome},
+		{"Market Cap", f.MarketCap},
+		{"Net Cash / D-E", strings.TrimSpace(f.NetCash + " / " + f.DebtEquity)},
+		{"BVPS", f.BookPerSh},
+		{"Div/sh / Yield / Payout", strings.TrimSpace(f.DivPerSh + " / " + f.DivYield + " / " + f.Payout)},
+		{"Beta", f.Beta},
+		{"Analyst", strings.TrimSpace(f.Consensus + " TP " + f.PriceTP + " (upside " + f.UpsidePct + ")")},
+	}
+	for _, r := range rows {
+		v := strings.TrimSpace(r.v)
+		if v != "" && v != "/" {
+			fmt.Printf("  %-24s %s\n", r.k, v)
+		}
+	}
 }
 
 func runOrderbook(cfg config.Config, rest []string) int {

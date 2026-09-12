@@ -148,10 +148,10 @@ type chartResponse struct {
 	Chart struct {
 		Result []struct {
 			Meta struct {
-				PreviousClose float64 `json:"previousClose"`
+				PreviousClose      float64 `json:"previousClose"`
 				RegularMarketPrice float64 `json:"regularMarketPrice"`
 			} `json:"meta"`
-			Timestamp []int64 `json:"timestamp"`
+			Timestamp  []int64 `json:"timestamp"`
 			Indicators struct {
 				Quote []struct {
 					Open   []float64 `json:"open"`

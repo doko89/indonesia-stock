@@ -2,8 +2,8 @@ package cache
 
 import (
 	"bufio"
-	"io"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -11,10 +11,10 @@ import (
 )
 
 type Client struct {
-	addr string
-	mu   sync.RWMutex
-	mem  map[string]map[float64]string
-	memKV map[string]string
+	addr      string
+	mu        sync.RWMutex
+	mem       map[string]map[float64]string
+	memKV     map[string]string
 	available bool
 }
 
@@ -161,7 +161,6 @@ func (c *Client) redisGet(key string) (string, error) {
 	}
 	return string(buf[:n]), nil
 }
-
 
 func (c *Client) redisCmd(args ...string) error {
 	conn, err := net.DialTimeout("tcp", c.addr, 800*time.Millisecond)

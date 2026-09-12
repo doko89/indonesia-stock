@@ -5,20 +5,20 @@ import "time"
 type Board string
 
 const (
-	BoardUtama      Board = "Utama"
+	BoardUtama        Board = "Utama"
 	BoardPengembangan Board = "Pengembangan"
-	BoardAkselerasi Board = "Akselerasi"
-	BoardEkonomiBaru Board = "Ekonomi Baru"
+	BoardAkselerasi   Board = "Akselerasi"
+	BoardEkonomiBaru  Board = "Ekonomi Baru"
 )
 
 type Stock struct {
-	Code        string    `json:"code"`
-	Name        string    `json:"name"`
-	Board       Board     `json:"board"`
-	ListedDate  time.Time `json:"listed_date"`
-	Shares      int64     `json:"shares"`
-	Currency    string    `json:"currency"`
-	Sector      string    `json:"sector"`
+	Code       string    `json:"code"`
+	Name       string    `json:"name"`
+	Board      Board     `json:"board"`
+	ListedDate time.Time `json:"listed_date"`
+	Shares     int64     `json:"shares"`
+	Currency   string    `json:"currency"`
+	Sector     string    `json:"sector"`
 }
 
 type Quote struct {

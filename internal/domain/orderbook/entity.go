@@ -3,9 +3,9 @@ package orderbook
 import "time"
 
 type Level struct {
-	Price float64 `json:"price"`
-	Lot   int64   `json:"lot"`
-	Orders int    `json:"orders,omitempty"`
+	Price  float64 `json:"price"`
+	Lot    int64   `json:"lot"`
+	Orders int     `json:"orders,omitempty"`
 }
 
 type Orderbook struct {
