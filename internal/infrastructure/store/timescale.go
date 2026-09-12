@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	// blank import registers the "postgres" database/sql driver (required by
+	// sql.Open in NewClient); the package is never referenced directly.
 	_ "github.com/lib/pq"
 )
 

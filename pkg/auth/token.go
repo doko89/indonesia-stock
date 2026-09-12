@@ -24,10 +24,25 @@ type StoredToken struct {
 	UserID       int64     `json:"user_id"`
 }
 
+// EnvTokenPrefix is the .env key prefix for the Stockbit token; exported so
+// pkg/config reuses the same literal (Sonar: duplicated string literals).
+const EnvTokenPrefix = envTokenPrefix
+
+// Shared path/literal constants (Sonar: duplicated string literals).
+const (
+	tokenFileName   = "token.json"
+	configDirName   = ".config"
+	appDirName      = "indostock"
+	envTokenPrefix  = "STOCKBIT_TOKEN="
+	journalGlob     = "refresh_journal_*.json"
+	journalTimeFmt  = "20060102T150405"
+	journalKeepLast = 10
+)
+
 var (
 	defaultPaths = []string{
-		"/apps/indostock/token.json",
-		"/etc/indostock/token.json",
+		"/apps/indostock/" + tokenFileName,
+		"/etc/indostock/" + tokenFileName,
 	}
 	secondaryStore Store
 	secondaryMu    sync.RWMutex
@@ -86,11 +101,11 @@ func newUUID() string {
 func TokenFileCandidates() []string {
 	paths := append([]string{}, defaultPaths...)
 	if h := os.Getenv("HOME"); h != "" {
-		paths = append(paths, filepath.Join(h, ".config", "indostock", "token.json"))
-		paths = append(paths, filepath.Join(h, ".indostock", "token.json"))
-		paths = append(paths, filepath.Join(h, ".config", "indostock", "token"))
+		paths = append(paths, filepath.Join(h, configDirName, appDirName, tokenFileName))
+		paths = append(paths, filepath.Join(h, ".indostock", tokenFileName))
+		paths = append(paths, filepath.Join(h, configDirName, appDirName, "token"))
 	}
-	paths = append(paths, "./token.json")
+	paths = append(paths, "./"+tokenFileName)
 	return paths
 }
 
@@ -115,6 +130,48 @@ func Load() (*StoredToken, error) {
 	return LoadFrom(path)
 }
 
+// parseStoredJSON parses token.json content: either our StoredToken shape or
+// an exported login-response with data.access_token.
+func parseStoredJSON(b []byte, path string) (*StoredToken, error) {
+	var t StoredToken
+	if err := json.Unmarshal(b, &t); err != nil {
+		return nil, fmt.Errorf("parse token json %s: %w", path, err)
+	}
+	if t.AccessToken == "" {
+		var m map[string]any
+		if json.Unmarshal(b, &m) == nil {
+			if v, ok := m["data"].(map[string]any); ok {
+				if tok, ok := v["access_token"].(string); ok {
+					t.AccessToken = tok
+				}
+			}
+		}
+	}
+	if t.ExpiresAt.IsZero() && t.AccessToken != "" {
+		if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
+			t.ExpiresAt = exp
+		}
+	}
+	return &t, nil
+}
+
+// tokenFromEnvStyle extracts STOCKBIT_TOKEN from a pasted .env-style file.
+func tokenFromEnvStyle(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if idx := strings.Index(line, envTokenPrefix); idx != -1 {
+			v := strings.TrimSpace(line[idx+len(envTokenPrefix):])
+			v = strings.Trim(v, "\"'")
+			v = strings.TrimPrefix(v, "export ")
+			v = strings.Trim(v, "\"' ")
+			if v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
 func LoadFrom(path string) (*StoredToken, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -122,43 +179,12 @@ func LoadFrom(path string) (*StoredToken, error) {
 	}
 	s := strings.TrimSpace(string(b))
 	if strings.HasPrefix(s, "{") {
-		var t StoredToken
-		if err := json.Unmarshal(b, &t); err != nil {
-			return nil, fmt.Errorf("parse token json %s: %w", path, err)
-		}
-		if t.AccessToken == "" {
-			var m map[string]any
-			if json.Unmarshal(b, &m) == nil {
-				if v, ok := m["data"].(map[string]any); ok {
-					if tok, ok := v["access_token"].(string); ok {
-						t.AccessToken = tok
-					}
-				}
-			}
-		}
-		if t.ExpiresAt.IsZero() && t.AccessToken != "" {
-			if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
-				t.ExpiresAt = exp
-			}
-		}
-		return &t, nil
+		return parseStoredJSON(b, path)
 	}
 	// plain token or env style
-	tok := strings.Trim(strings.TrimSpace(s), "\"'")
-	if strings.Contains(tok, "STOCKBIT_TOKEN=") {
-		for _, line := range strings.Split(s, "\n") {
-			line = strings.TrimSpace(line)
-			if idx := strings.Index(line, "STOCKBIT_TOKEN="); idx != -1 {
-				v := strings.TrimSpace(line[idx+len("STOCKBIT_TOKEN="):])
-				v = strings.Trim(v, "\"'")
-				v = strings.TrimPrefix(v, "export ")
-				v = strings.Trim(v, "\"' ")
-				if v != "" {
-					tok = v
-					break
-				}
-			}
-		}
+	tok := strings.Trim(s, "\"'")
+	if strings.Contains(tok, envTokenPrefix) {
+		tok = tokenFromEnvStyle(s)
 	}
 	if tok == "" {
 		return nil, fmt.Errorf("empty token in %s", path)
@@ -184,7 +210,7 @@ func Save(t *StoredToken, path string) error {
 		if found := FindTokenFile(); found != "" {
 			path = found
 		} else if h := os.Getenv("HOME"); h != "" {
-			path = filepath.Join(h, ".config", "indostock", "token.json")
+			path = filepath.Join(h, configDirName, appDirName, tokenFileName)
 			if h == "/root" || h == "" {
 				path = defaultPaths[0]
 			}
@@ -245,18 +271,25 @@ func IsExpired(t *StoredToken, buffer time.Duration) bool {
 	return time.Now().Add(buffer).After(t.ExpiresAt)
 }
 
-type refreshResp struct {
+// tokenPayload is the nested access/refresh pair inside a refresh response
+// (named type per Sonar: anonymous struct extraction; also used by the
+// L251/L255 findings — same shape reused three times).
+type tokenPayload struct {
+	Access struct {
+		Token     string `json:"token"`
+		ExpiredAt string `json:"expired_at"`
+	} `json:"access"`
+	Refresh struct {
+		Token     string `json:"token"`
+		ExpiredAt string `json:"expired_at"`
+	} `json:"refresh"`
+}
+
+// refreshEnvelope wraps tokenPayload shapes seen from /login/refresh.
+type refreshEnvelope struct {
 	Data struct {
-		Refresh struct {
-			Access struct {
-				Token     string `json:"token"`
-				ExpiredAt string `json:"expired_at"`
-			} `json:"access"`
-			Refresh struct {
-				Token     string `json:"token"`
-				ExpiredAt string `json:"expired_at"`
-			} `json:"refresh"`
-		} `json:"refresh"`
+		Refresh   tokenPayload `json:"refresh"`
+		TokenData tokenPayload `json:"token_data"`
 	} `json:"data"`
 }
 
@@ -339,14 +372,14 @@ func journalRefreshResponse(body []byte) string {
 	if dir == "" {
 		dir = "/tmp"
 	}
-	name := filepath.Join(dir, fmt.Sprintf("refresh_journal_%s.json", time.Now().UTC().Format("20060102T150405")))
+	name := filepath.Join(dir, "refresh_journal_"+time.Now().UTC().Format(journalTimeFmt)+".json")
 	if err := os.WriteFile(name, body, 0600); err != nil {
 		return ""
 	}
 	// keep last 10 journals
-	if matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json")); len(matches) > 10 {
+	if matches, _ := filepath.Glob(filepath.Join(dir, journalGlob)); len(matches) > journalKeepLast {
 		sort.Strings(matches)
-		for _, old := range matches[:len(matches)-10] {
+		for _, old := range matches[:len(matches)-journalKeepLast] {
 			_ = os.Remove(old)
 		}
 	}
@@ -366,7 +399,7 @@ func loadRefreshJournal() ([]byte, string, error) {
 	if dir == "" {
 		return nil, "", fmt.Errorf("no token file location known yet")
 	}
-	matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json"))
+	matches, _ := filepath.Glob(filepath.Join(dir, journalGlob))
 	if len(matches) == 0 {
 		if last := filepath.Join(dir, "last_refresh_response.json"); fileExists(last) {
 			matches = []string{last}
@@ -388,6 +421,57 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// waitForPeerRotation polls while another process holds the refresh lock,
+// adopting its result when it lands. Returns (token, releaseFn, ok).
+func waitForPeerRotation(t *StoredToken) (*StoredToken, func(), bool) {
+	for i := 0; i < 12; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" && cur.RefreshToken != t.RefreshToken {
+			return cur, func() {}, true // peer's rotation produced a new pair; adopt it
+		}
+		if locked, r2 := acquireRefreshLock(); locked {
+			return nil, r2, false // we got the lock; caller proceeds to rotate
+		}
+	}
+	return nil, func() {}, false
+}
+
+// buildRotatedToken maps the refresh response onto a StoredToken with expiry
+// from the explicit field, the JWT, or a 24h fallback — in that order.
+func buildRotatedToken(old *StoredToken, at, rt, atExp string) *StoredToken {
+	nt := &StoredToken{AccessToken: at, RefreshToken: rt, UserID: old.UserID}
+	if atExp != "" {
+		if ts, err := time.Parse(time.RFC3339, atExp); err == nil {
+			nt.ExpiresAt = ts.UTC()
+		}
+	}
+	if nt.ExpiresAt.IsZero() {
+		if exp := jwtExpiry(nt.AccessToken); !exp.IsZero() {
+			nt.ExpiresAt = exp
+		} else {
+			nt.ExpiresAt = time.Now().Add(24 * time.Hour)
+		}
+	}
+	return nt
+}
+
+// validateRotation refuses bad rotation results (empty/same/expired rt).
+func validateRotation(nt *StoredToken, oldRT, journal string) error {
+	if nt.AccessToken == "" {
+		return fmt.Errorf("refresh returned empty access token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
+	}
+	if nt.RefreshToken == "" {
+		return fmt.Errorf("refresh returned empty refresh token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
+	}
+	if nt.RefreshToken == oldRT {
+		return fmt.Errorf("refresh returned the SAME refresh token (rotation did not happen; refusing to overwrite — journal at %s)", journal)
+	}
+	if nExp := jwtExpiry(nt.RefreshToken); !nExp.IsZero() && nExp.Before(time.Now()) {
+		return fmt.Errorf("refresh returned an already-expired refresh token (exp %s) — journal at %s", nExp.Format(time.RFC3339), journal)
+	}
+	return nil
+}
+
 func Refresh(t *StoredToken) (*StoredToken, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
@@ -404,15 +488,10 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 	locked, release := acquireRefreshLock()
 	if !locked {
 		// someone else is rotating right now: poll for their result
-		for i := 0; i < 12; i++ {
-			time.Sleep(500 * time.Millisecond)
-			if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" && cur.RefreshToken != t.RefreshToken {
-				return cur, nil // peer's rotation produced a new pair; adopt it
-			}
-			if locked, r2 := acquireRefreshLock(); locked {
-				release = r2
-				break
-			}
+		var adopted *StoredToken
+		adopted, release, locked = waitForPeerRotation(t)
+		if adopted != nil {
+			return adopted, nil
 		}
 		if !locked {
 			return nil, fmt.Errorf("could not acquire refresh lock — another rotation is stuck?")
@@ -459,35 +538,9 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 
 	// accept multiple known shapes for the rotated token pair
 	at, rt, atExp := extractTokens(body)
-	nt := &StoredToken{
-		AccessToken:  at,
-		RefreshToken: rt,
-		UserID:       t.UserID,
-	}
-	if atExp != "" {
-		if ts, err := time.Parse(time.RFC3339, atExp); err == nil {
-			nt.ExpiresAt = ts.UTC()
-		}
-	}
-	if nt.ExpiresAt.IsZero() {
-		if exp := jwtExpiry(nt.AccessToken); !exp.IsZero() {
-			nt.ExpiresAt = exp
-		} else {
-			nt.ExpiresAt = time.Now().Add(24 * time.Hour)
-		}
-	}
-	if nt.AccessToken == "" {
-		return nil, fmt.Errorf("refresh returned empty access token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
-	}
-	// rotation sanity: new refresh token must differ and must not be expired
-	if rt == "" {
-		return nil, fmt.Errorf("refresh returned empty refresh token (raw response journaled at %s — recover with: indostock auth rescue)", journal)
-	}
-	if rt == t.RefreshToken {
-		return nil, fmt.Errorf("refresh returned the SAME refresh token (rotation did not happen; refusing to overwrite — journal at %s)", journal)
-	}
-	if nExp := jwtExpiry(rt); !nExp.IsZero() && nExp.Before(time.Now()) {
-		return nil, fmt.Errorf("refresh returned an already-expired refresh token (exp %s) — journal at %s", nExp.Format(time.RFC3339), journal)
+	nt := buildRotatedToken(t, at, rt, atExp)
+	if err := validateRotation(nt, t.RefreshToken, journal); err != nil {
+		return nil, err
 	}
 	// prefer existing file location
 	path := FindTokenFile()
@@ -546,6 +599,7 @@ func acquireRefreshLock() (bool, func()) {
 		if l.TryLock(id, 15*time.Second) {
 			return true, func() { l.Unlock(id) }
 		}
+		// no-op unlock: lock not acquired, nothing to release
 		return false, func() {}
 	}
 	// file fallback
@@ -584,6 +638,7 @@ func acquireFileLock() (bool, func()) {
 	}
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
+		// no-op unlock: lock not acquired, nothing to release
 		return false, func() {}
 	}
 	return true, func() {
@@ -706,7 +761,7 @@ func Status() map[string]any {
 	}
 	// last rotation info from journals
 	if dir := tokenDir(); dir != "" {
-		if matches, _ := filepath.Glob(filepath.Join(dir, "refresh_journal_*.json")); len(matches) > 0 {
+		if matches, _ := filepath.Glob(filepath.Join(dir, journalGlob)); len(matches) > 0 {
 			sort.Strings(matches)
 			last := matches[len(matches)-1]
 			if fi, err := os.Stat(last); err == nil {
@@ -743,6 +798,13 @@ func SaveToRedis(cacheClient interface {
 	return cacheClient.SetEx(RedisKey, string(b), ttl)
 }
 
+// redisTokenClient is the minimal cache surface the auth package needs
+// (named interface per Sonar: anonymous struct/interface extraction).
+type redisTokenClient interface {
+	Get(string) (string, error)
+	SetEx(string, string, time.Duration) error
+}
+
 func LoadFromRedis(cacheClient interface{ Get(string) (string, error) }) (*StoredToken, error) {
 	s, err := cacheClient.Get(RedisKey)
 	if err != nil {
@@ -758,47 +820,68 @@ func LoadFromRedis(cacheClient interface{ Get(string) (string, error) }) (*Store
 	return &t, nil
 }
 
-func GetValidTokenRedis(cacheClient interface {
-	Get(string) (string, error)
-	SetEx(string, string, time.Duration) error
-}) (string, error) {
-	if cacheClient != nil {
-		if t, err := LoadFromRedis(cacheClient); err == nil && t.AccessToken != "" {
-			if !IsExpired(t, 5*time.Minute) {
-				return t.AccessToken, nil
-			}
-			if t.RefreshToken != "" {
-				if locked, release := acquireRefreshLock(); locked {
-					// reload freshest under lock: a peer may have rotated
-					// already, and t's refresh token may be retired.
-					src := t
-					if cur, err := LoadFromRedis(cacheClient); err == nil && cur.RefreshToken != "" {
-						src = cur
-					} else if cur, err := Load(); err == nil && cur.RefreshToken != "" {
-						src = cur
-					}
-					nt, err := Refresh(src)
-					release()
-					if err == nil {
-						_ = SaveToRedis(cacheClient, nt)
-						_ = Save(nt, "")
-						return nt.AccessToken, nil
-					}
-				} else {
-					// peer is refreshing: wait briefly, then use a freshly
-					// loaded token — never rotate with the stale t.
-					time.Sleep(1200 * time.Millisecond)
-					if nt, err := LoadFromRedis(cacheClient); err == nil && !IsExpired(nt, 5*time.Minute) {
-						return nt.AccessToken, nil
-					}
-					if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
-						return nt.AccessToken, nil
-					}
+// freshestStored picks the most current token across Redis then file.
+func freshestStored(cacheClient redisTokenClient) *StoredToken {
+	if cur, err := LoadFromRedis(cacheClient); err == nil && cur.RefreshToken != "" {
+		return cur
+	}
+	if cur, err := Load(); err == nil && cur.RefreshToken != "" {
+		return cur
+	}
+	return nil
+}
+
+// rotateUnderLock performs the rotation while holding the refresh lock.
+func rotateUnderLock(cacheClient redisTokenClient, t *StoredToken) (string, error) {
+	src := t
+	if cur := freshestStored(cacheClient); cur != nil {
+		src = cur
+	}
+	nt, err := Refresh(src)
+	if err != nil {
+		return "", err
+	}
+	_ = SaveToRedis(cacheClient, nt)
+	_ = Save(nt, "")
+	return nt.AccessToken, nil
+}
+
+// awaitPeerRotation handles the not-locked case: wait, then use whichever
+// store now holds a fresh token — never rotate with the stale t.
+func awaitPeerRotation(cacheClient redisTokenClient) (string, bool) {
+	time.Sleep(1200 * time.Millisecond)
+	if nt, err := LoadFromRedis(cacheClient); err == nil && !IsExpired(nt, 5*time.Minute) {
+		return nt.AccessToken, true
+	}
+	if nt, err := Load(); err == nil && !IsExpired(nt, 5*time.Minute) {
+		return nt.AccessToken, true
+	}
+	return "", false
+}
+
+func GetValidTokenRedis(cacheClient redisTokenClient) (string, error) {
+	if cacheClient == nil {
+		return GetValidToken()
+	}
+	if t, err := LoadFromRedis(cacheClient); err == nil && t.AccessToken != "" {
+		if !IsExpired(t, 5*time.Minute) {
+			return t.AccessToken, nil
+		}
+		if t.RefreshToken != "" {
+			if locked, release := acquireRefreshLock(); locked {
+				// reload freshest under lock: a peer may have rotated
+				// already, and t's refresh token may be retired.
+				at, rerr := rotateUnderLock(cacheClient, t)
+				release()
+				if rerr == nil {
+					return at, nil
 				}
+			} else if at, ok := awaitPeerRotation(cacheClient); ok {
+				return at, nil
 			}
-			if !IsExpired(t, 0) {
-				return t.AccessToken, nil
-			}
+		}
+		if !IsExpired(t, 0) {
+			return t.AccessToken, nil
 		}
 	}
 	return GetValidToken()

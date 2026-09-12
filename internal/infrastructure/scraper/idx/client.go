@@ -71,14 +71,12 @@ func (c *Client) GetXBRLReport(ctx context.Context, year, quarter int, code stri
 	return mockXBRLReport(code, year, quarter), nil
 }
 
-func tryParseZip(zipBytes []byte, code string, year, quarter int) *financial.XBRLReport {
-	reader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-	if err != nil {
-		return nil
-	}
-	var generalHTML, balanceHTML string
+// pickZipHTMLs scans the archive for the general-info and balance-sheet
+// HTML members (Sonar: cognitive complexity — extracted from tryParseZip).
+func pickZipHTMLs(reader *zip.Reader) (generalHTML, balanceHTML string) {
 	for _, f := range reader.File {
-		if !strings.HasSuffix(strings.ToLower(f.Name), ".html") && !strings.HasSuffix(strings.ToLower(f.Name), ".htm") {
+		name := strings.ToLower(f.Name)
+		if !strings.HasSuffix(name, ".html") && !strings.HasSuffix(name, ".htm") {
 			continue
 		}
 		rc, _ := f.Open()
@@ -96,6 +94,33 @@ func tryParseZip(zipBytes []byte, code string, year, quarter int) *financial.XBR
 			balanceHTML = content
 		}
 	}
+	return generalHTML, balanceHTML
+}
+
+// attachBalanceSheet fills rep.BalanceSheet from the best available HTML.
+func attachBalanceSheet(rep *financial.XBRLReport, generalHTML, balanceHTML string) {
+	if rep == nil {
+		return
+	}
+	if balanceHTML != "" && balanceHTML != generalHTML {
+		if bs := parseBalanceSheet(balanceHTML); len(bs) > 0 {
+			rep.BalanceSheet = bs
+		}
+		return
+	}
+	if len(rep.BalanceSheet) == 0 {
+		if bs := parseBalanceSheet(generalHTML); len(bs) > 0 {
+			rep.BalanceSheet = bs
+		}
+	}
+}
+
+func tryParseZip(zipBytes []byte, code string, year, quarter int) *financial.XBRLReport {
+	reader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+	if err != nil {
+		return nil
+	}
+	generalHTML, balanceHTML := pickZipHTMLs(reader)
 	if generalHTML == "" && balanceHTML == "" {
 		return nil
 	}
@@ -103,17 +128,7 @@ func tryParseZip(zipBytes []byte, code string, year, quarter int) *financial.XBR
 	if rep == nil {
 		rep = &financial.XBRLReport{StockCode: code, Year: year, Quarter: quarter, Source: "idx-zip"}
 	}
-	if balanceHTML != "" && balanceHTML != generalHTML {
-		bs := parseBalanceSheet(balanceHTML)
-		if len(bs) > 0 {
-			rep.BalanceSheet = bs
-		}
-	} else if len(rep.BalanceSheet) == 0 {
-		bs := parseBalanceSheet(generalHTML)
-		if len(bs) > 0 {
-			rep.BalanceSheet = bs
-		}
-	}
+	attachBalanceSheet(rep, generalHTML, balanceHTML)
 	rep.Source = "idx"
 	return rep
 }
@@ -213,11 +228,4 @@ func mockXBRLReport(code string, year, quarter int) *financial.XBRLReport {
 		},
 		Source: "mock",
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

@@ -61,11 +61,14 @@ Files checked (in order): /apps/indostock/token.json, /etc/indostock/token.json,
 `)
 }
 
+// flagCompact is the shared output-format flag across all auth subcommands.
+const flagCompact = "--compact"
+
 func runAuthStatus(args []string) int {
 	compact := false
 	jsonOut := true
 	for _, a := range args {
-		if a == "--compact" {
+		if a == flagCompact {
 			compact = true
 		}
 		if a == "--json=false" || a == "--no-json" {
@@ -101,7 +104,7 @@ func runAuthStatus(args []string) int {
 func runAuthRefresh(args []string) int {
 	compact := false
 	for _, a := range args {
-		if a == "--compact" {
+		if a == flagCompact {
 			compact = true
 		}
 	}
@@ -144,34 +147,65 @@ func runAuthRefresh(args []string) int {
 	return 0
 }
 
-func runAuthSave(args []string) int {
-	var token, refresh, file string
-	stdin := false
-	compact := false
+// parseArgsFlag walks args for "--name value" and "--name=value" pairs.
+// Returns (values map, rest flags seen as bare words).
+func parseArgsFlag(args []string, names ...string) map[string]string {
+	out := make(map[string]string, len(names))
 	for i := 0; i < len(args); i++ {
 		a := args[i]
-		switch {
-		case a == "--token" && i+1 < len(args):
-			i++
-			token = args[i]
-		case strings.HasPrefix(a, "--token="):
-			token = strings.TrimPrefix(a, "--token=")
-		case a == "--refresh" && i+1 < len(args):
-			i++
-			refresh = args[i]
-		case strings.HasPrefix(a, "--refresh="):
-			refresh = strings.TrimPrefix(a, "--refresh=")
-		case a == "--file" && i+1 < len(args):
-			i++
-			file = args[i]
-		case strings.HasPrefix(a, "--file="):
-			file = strings.TrimPrefix(a, "--file=")
-		case a == "--stdin":
-			stdin = true
-		case a == "--compact":
-			compact = true
+		for _, n := range names {
+			if a == "--"+n && i+1 < len(args) {
+				i++
+				out[n] = args[i]
+			} else if strings.HasPrefix(a, "--"+n+"=") {
+				out[n] = strings.TrimPrefix(a, "--"+n+"=")
+			}
 		}
 	}
+	return out
+}
+
+// extractStdinTokens digs access/refresh tokens out of arbitrary pasted JSON
+// (full login response, token_data wrapper, or plain token.json shape).
+func extractStdinTokens(m map[string]any) (token, refresh string) {
+	if v, ok := m["access_token"].(string); ok {
+		token = v
+	}
+	if v, ok := m["refresh_token"].(string); ok {
+		refresh = v
+	}
+	if v, ok := m["data"].(map[string]any); ok {
+		if l, ok := v["login"].(map[string]any); ok {
+			if td, ok := l["token_data"].(map[string]any); ok {
+				token, refresh = digTokenData(td, token, refresh)
+			}
+		}
+		if td, ok := v["token_data"].(map[string]any); ok {
+			token, refresh = digTokenData(td, token, refresh)
+		}
+	}
+	return token, refresh
+}
+
+func digTokenData(td map[string]any, token, refresh string) (string, string) {
+	if ac, ok := td["access"].(map[string]any); ok {
+		if tok, ok := ac["token"].(string); ok && tok != "" {
+			token = tok
+		}
+	}
+	if rf, ok := td["refresh"].(map[string]any); ok {
+		if tok, ok := rf["token"].(string); ok && tok != "" {
+			refresh = tok
+		}
+	}
+	return token, refresh
+}
+
+func runAuthSave(args []string) int {
+	vals := parseArgsFlag(args, "token", "refresh", "file")
+	token, refresh, file := vals["token"], vals["refresh"], vals["file"]
+	stdin := sliceContains(args, "--stdin")
+	compact := sliceContains(args, flagCompact)
 	if stdin {
 		b, err := io.ReadAll(os.Stdin)
 		if err != nil {
@@ -180,28 +214,7 @@ func runAuthSave(args []string) int {
 		}
 		var m map[string]any
 		if err := json.Unmarshal(b, &m); err == nil {
-			if v, ok := m["access_token"].(string); ok {
-				token = v
-			}
-			if v, ok := m["refresh_token"].(string); ok {
-				refresh = v
-			}
-			if v, ok := m["data"].(map[string]any); ok {
-				if l, ok := v["login"].(map[string]any); ok {
-					if td, ok := l["token_data"].(map[string]any); ok {
-						if ac, ok := td["access"].(map[string]any); ok {
-							if tok, ok := ac["token"].(string); ok {
-								token = tok
-							}
-						}
-						if rf, ok := td["refresh"].(map[string]any); ok {
-							if tok, ok := rf["token"].(string); ok {
-								refresh = tok
-							}
-						}
-					}
-				}
-			}
+			token, refresh = extractStdinTokens(m)
 		} else {
 			s := strings.TrimSpace(string(b))
 			if len(s) > 100 && strings.Count(s, ".") == 2 {
@@ -250,7 +263,7 @@ func runAuthSave(args []string) int {
 // token store. Escape hatch when a rotation succeeded server-side but the
 // parser failed client-side (the 2026-09-12 incident).
 func runAuthRescue(args []string) int {
-	compact := sliceContains(args, "--compact")
+	compact := sliceContains(args, flagCompact)
 	nt, journal, err := auth.Rescue()
 	out := map[string]any{"journal": journal}
 	if err != nil {

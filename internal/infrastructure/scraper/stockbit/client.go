@@ -155,6 +155,33 @@ func findDeep(m map[string]any, keys []string) any {
 	return nil
 }
 
+// levelFromPair parses a [price, lot] array-shaped orderbook entry.
+func levelFromPair(v []any) (orderbook.Level, bool) {
+	if len(v) < 2 {
+		return orderbook.Level{}, false
+	}
+	price := toFloat(v[0])
+	lot := toLot(v[1])
+	if price <= 0 {
+		return orderbook.Level{}, false
+	}
+	return orderbook.Level{Price: price, Lot: lot}, true
+}
+
+// levelFromMap parses an object-shaped orderbook entry (several key styles).
+func levelFromMap(v map[string]any) (orderbook.Level, bool) {
+	price := toFloat(firstOf(v, []string{"price", "p", "harga", "Price"}))
+	lot := toLot(firstOf(v, []string{"lot", "quantity", "qty", "volume", "vol", "q", "Lot", "remaining"}))
+	orders := int(toFloat(firstOf(v, []string{"orders", "count", "n"})))
+	if price == 0 {
+		return orderbook.Level{}, false
+	}
+	if lot == 0 {
+		lot = 1
+	}
+	return orderbook.Level{Price: price, Lot: lot, Orders: orders}, true
+}
+
 func parseLevels(raw any) []orderbook.Level {
 	arr, ok := raw.([]any)
 	if !ok {
@@ -164,24 +191,13 @@ func parseLevels(raw any) []orderbook.Level {
 	for _, item := range arr {
 		switch v := item.(type) {
 		case []any:
-			if len(v) >= 2 {
-				price := toFloat(v[0])
-				lot := toLot(v[1])
-				if price > 0 {
-					levels = append(levels, orderbook.Level{Price: price, Lot: lot})
-				}
+			if lvl, ok := levelFromPair(v); ok {
+				levels = append(levels, lvl)
 			}
 		case map[string]any:
-			price := toFloat(firstOf(v, []string{"price", "p", "harga", "Price"}))
-			lot := toLot(firstOf(v, []string{"lot", "quantity", "qty", "volume", "vol", "q", "Lot", "remaining"}))
-			orders := int(toFloat(firstOf(v, []string{"orders", "count", "n"})))
-			if price == 0 {
-				continue
+			if lvl, ok := levelFromMap(v); ok {
+				levels = append(levels, lvl)
 			}
-			if lot == 0 {
-				lot = 1
-			}
-			levels = append(levels, orderbook.Level{Price: price, Lot: lot, Orders: orders})
 		case float64:
 			levels = append(levels, orderbook.Level{Price: v, Lot: 1})
 		}
@@ -240,13 +256,6 @@ func toLot(v any) int64 {
 	default:
 		return 0
 	}
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func (c *Client) Stream(ctx context.Context, symbol string, intervalSeconds int) (<-chan orderbook.Orderbook, error) {

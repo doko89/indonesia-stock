@@ -23,8 +23,9 @@ fi
 
 echo "== Buat DB indostock =="
 # password comes from env (or .env), never hardcoded (Sonar: secret in code)
-if [ -z "${POSTGRES_PASSWORD:-}" ]; then
-  echo "ERROR: export POSTGRES_PASSWORD first (or source .env)"; exit 1
+# [[ ]] (bash) is safer than POSIX '[' — Sonar bash best practice
+if [[ -z "${POSTGRES_PASSWORD:-}" ]]; then
+  echo "ERROR: export POSTGRES_PASSWORD first (or source .env)" >&2; exit 1
 fi
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='indostock'" | grep -q 1 || sudo -u postgres createdb indostock
 sudo -u postgres psql -d indostock -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"

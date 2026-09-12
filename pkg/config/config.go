@@ -246,15 +246,11 @@ func readTokenFile(path string) string {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if idx := strings.Index(line, "STOCKBIT_TOKEN="); idx != -1 {
-			v := strings.TrimSpace(line[idx+len("STOCKBIT_TOKEN="):])
-			v = strings.Trim(v, "\"'")
+		if idx := strings.Index(line, auth.EnvTokenPrefix); idx != -1 {
+			v := strings.TrimSpace(line[idx+len(auth.EnvTokenPrefix):])
+			// tolerate `export STOCKBIT_TOKEN=...` and quoted values
 			v = strings.TrimPrefix(v, "export ")
-			v = strings.Trim(v, "\"'")
-			if strings.HasPrefix(v, "export ") {
-				v = strings.TrimSpace(strings.TrimPrefix(v, "export "))
-			}
-			v = strings.Trim(v, "\"'")
+			v = strings.Trim(v, "\"' ")
 			if v != "" {
 				return v
 			}

@@ -122,6 +122,12 @@ type payload struct {
 	} `json:"nodes"`
 }
 
+// maxResolveDepth/maxResolveRefs bound pathological payloads.
+const (
+	maxResolveDepth = 32
+	maxResolveRefs  = 200000
+)
+
 // resolve dereferences the devalue integer-ref encoding.
 // data[0] is the root; any integer appearing as an object value / array
 // element is a pointer to data[n]. Bare integers that are genuine numbers
@@ -135,45 +141,52 @@ func resolve(data []json.RawMessage) (map[string]any, error) {
 	if err := json.Unmarshal(data[0], &rootRaw); err != nil {
 		return nil, err
 	}
-	seen := 0
-	var walk func(v any, depth int) any
-	walk = func(v any, depth int) any {
-		if depth > 32 || seen > 200000 {
-			return nil
-		}
-		switch tv := v.(type) {
-		case float64:
-			idx := int(tv)
-			if idx >= 0 && idx < len(data) && float64(idx) == tv {
-				seen++
-				var nxt any
-				if err := json.Unmarshal(data[idx], &nxt); err != nil {
-					return nil
-				}
-				return walk(nxt, depth+1)
-			}
-			return tv
-		case map[string]any:
-			out := make(map[string]any, len(tv))
-			for k, vv := range tv {
-				out[k] = walk(vv, depth+1)
-			}
-			return out
-		case []any:
-			out := make([]any, len(tv))
-			for i, vv := range tv {
-				out[i] = walk(vv, depth+1)
-			}
-			return out
-		default:
-			return v
-		}
-	}
-	root, ok := walk(rootRaw, 0).(map[string]any)
+	r := &devalueResolver{data: data}
+	root, ok := r.walk(rootRaw, 0).(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("root is not an object")
 	}
 	return root, nil
+}
+
+// devalueResolver carries walker state without a closure (Sonar:
+// cognitive complexity on resolve — split recursion into a method).
+type devalueResolver struct {
+	data []json.RawMessage
+	seen int
+}
+
+func (r *devalueResolver) walk(v any, depth int) any {
+	if depth > maxResolveDepth || r.seen > maxResolveRefs {
+		return nil
+	}
+	switch tv := v.(type) {
+	case float64:
+		idx := int(tv)
+		if idx >= 0 && idx < len(r.data) && float64(idx) == tv {
+			r.seen++
+			var nxt any
+			if err := json.Unmarshal(r.data[idx], &nxt); err != nil {
+				return nil
+			}
+			return r.walk(nxt, depth+1)
+		}
+		return tv
+	case map[string]any:
+		out := make(map[string]any, len(tv))
+		for k, vv := range tv {
+			out[k] = r.walk(vv, depth+1)
+		}
+		return out
+	case []any:
+		out := make([]any, len(tv))
+		for i, vv := range tv {
+			out[i] = r.walk(vv, depth+1)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func parseStatistics(body []byte) (*Fundamentals, error) {
@@ -202,126 +215,152 @@ func parseStatistics(body []byte) (*Fundamentals, error) {
 	}
 
 	f := &Fundamentals{}
-	// sections: map[sectionName] -> {"text":..., "data":[{"id","title","value","hover"}]}
-	collect := func(section string, fn func(id, value, hover string)) {
-		sec, ok := root[section].(map[string]any)
-		if !ok {
-			return
-		}
-		items, ok := sec["data"].([]any)
-		if !ok {
-			return
-		}
-		for _, it := range items {
-			m, ok := it.(map[string]any)
-			if !ok {
-				continue
-			}
-			id, _ := m["id"].(string)
-			val, _ := m["value"].(string)
-			hov, _ := m["hover"].(string)
-			fn(id, val, hov)
-		}
-	}
-	// prefer hover (raw number) over display value when both exist
-	setFrom := func(dst *string, val, hover string) {
-		if hover != "" && hover != "n/a" {
-			*dst = hover
-		} else if val != "" && val != "n/a" {
-			*dst = val
-		}
-	}
-
-	collect("ratios", func(id, val, hov string) {
-		switch id {
-		case "pe":
-			setFrom(&f.PE, val, hov)
-		case "peForward":
-			setFrom(&f.PEForward, val, hov)
-		case "ps":
-			setFrom(&f.PS, val, hov)
-		case "pb":
-			setFrom(&f.PBV, val, hov)
-		case "pegRatio":
-			setFrom(&f.PEG, val, hov)
-		}
-	})
-	collect("valuation", func(id, val, hov string) {
-		switch id {
-		case "marketcap":
-			setFrom(&f.MarketCap, val, hov)
-		}
-	})
-	collect("financialEfficiency", func(id, val, hov string) {
-		switch id {
-		case "roe":
-			setFrom(&f.ROE, val, hov)
-		case "roa":
-			setFrom(&f.ROA, val, hov)
-		}
-	})
-	collect("financialPosition", func(id, val, hov string) {
-		switch id {
-		case "debtEquity":
-			setFrom(&f.DebtEquity, val, hov)
-		}
-	})
-	collect("balanceSheet", func(id, val, hov string) {
-		switch id {
-		case "bvps":
-			setFrom(&f.BookPerSh, val, hov)
-		case "netcash":
-			setFrom(&f.NetCash, val, hov)
-		}
-	})
-	collect("incomeStatement", func(id, val, hov string) {
-		switch id {
-		case "eps":
-			setFrom(&f.EPS, val, hov)
-		case "revenue":
-			setFrom(&f.Revenue, val, hov)
-		case "netIncome":
-			setFrom(&f.NetIncome, val, hov)
-		}
-	})
-	collect("margins", func(id, val, hov string) {
-		switch id {
-		case "operatingMargin":
-			setFrom(&f.OpMargin, val, hov)
-		case "profitMargin":
-			setFrom(&f.ProfMargin, val, hov)
-		}
-	})
-	collect("dividends", func(id, val, hov string) {
-		switch id {
-		case "dps", "dividendPerShare":
-			setFrom(&f.DivPerSh, val, hov)
-		case "dividendYield":
-			setFrom(&f.DivYield, val, hov)
-		case "payoutRatio":
-			setFrom(&f.Payout, val, hov)
-		}
-	})
-	collect("stockPrice", func(id, val, hov string) {
-		if id == "beta" {
-			setFrom(&f.Beta, val, hov)
-		}
-	})
-	collect("analystForecasts", func(id, val, hov string) {
-		switch id {
-		case "analystRatings", "consensus":
-			f.Consensus = val
-		case "priceTarget":
-			setFrom(&f.PriceTP, val, hov)
-		case "priceTargetChange", "upside":
-			setFrom(&f.UpsidePct, val, hov)
-		}
-	})
+	sec := sectionCollector{root: root}
+	sec.each("ratios", f.applyRatios)
+	sec.each("valuation", f.applyValuation)
+	sec.each("financialEfficiency", f.applyEfficiency)
+	sec.each("financialPosition", f.applyPosition)
+	sec.each("balanceSheet", f.applyBalanceSheet)
+	sec.each("incomeStatement", f.applyIncome)
+	sec.each("margins", f.applyMargins)
+	sec.each("dividends", f.applyDividends)
+	sec.each("stockPrice", f.applyPrice)
+	sec.each("analystForecasts", f.applyAnalyst)
 
 	if f.PE == "" && f.PBV == "" && f.ROE == "" {
 		return nil, fmt.Errorf("payload resolved but contains no valuation metrics (page shape changed?)")
 	}
 	return f, nil
+}
+
+// sectionCollector walks {"section": {"data": [{id,title,value,hover}]}} maps
+// from a resolved devalue root (Sonar: cognitive complexity — extraction).
+type sectionCollector struct {
+	root map[string]any
+}
+
+// each calls fn for every {id,value,hover} item in the named section.
+func (s sectionCollector) each(section string, fn func(id, value, hover string)) {
+	sec, ok := s.root[section].(map[string]any)
+	if !ok {
+		return
+	}
+	items, ok := sec["data"].([]any)
+	if !ok {
+		return
+	}
+	for _, it := range items {
+		m, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		val, _ := m["value"].(string)
+		hov, _ := m["hover"].(string)
+		fn(id, val, hov)
+	}
+}
+
+// setFrom prefers hover (raw number) over display value; "n/a" is skipped.
+func setFrom(dst *string, val, hover string) {
+	if hover != "" && hover != "n/a" {
+		*dst = hover
+	} else if val != "" && val != "n/a" {
+		*dst = val
+	}
+}
+
+func (f *Fundamentals) applyRatios(id, val, hov string) {
+	switch id {
+	case "pe":
+		setFrom(&f.PE, val, hov)
+	case "peForward":
+		setFrom(&f.PEForward, val, hov)
+	case "ps":
+		setFrom(&f.PS, val, hov)
+	case "pb":
+		setFrom(&f.PBV, val, hov)
+	case "pegRatio":
+		setFrom(&f.PEG, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyValuation(id, val, hov string) {
+	if id == "marketcap" {
+		setFrom(&f.MarketCap, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyEfficiency(id, val, hov string) {
+	switch id {
+	case "roe":
+		setFrom(&f.ROE, val, hov)
+	case "roa":
+		setFrom(&f.ROA, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyPosition(id, val, hov string) {
+	if id == "debtEquity" {
+		setFrom(&f.DebtEquity, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyBalanceSheet(id, val, hov string) {
+	switch id {
+	case "bvps":
+		setFrom(&f.BookPerSh, val, hov)
+	case "netcash":
+		setFrom(&f.NetCash, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyIncome(id, val, hov string) {
+	switch id {
+	case "eps":
+		setFrom(&f.EPS, val, hov)
+	case "revenue":
+		setFrom(&f.Revenue, val, hov)
+	case "netIncome":
+		setFrom(&f.NetIncome, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyMargins(id, val, hov string) {
+	switch id {
+	case "operatingMargin":
+		setFrom(&f.OpMargin, val, hov)
+	case "profitMargin":
+		setFrom(&f.ProfMargin, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyDividends(id, val, hov string) {
+	switch id {
+	case "dps", "dividendPerShare":
+		setFrom(&f.DivPerSh, val, hov)
+	case "dividendYield":
+		setFrom(&f.DivYield, val, hov)
+	case "payoutRatio":
+		setFrom(&f.Payout, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyPrice(id, val, hov string) {
+	if id == "beta" {
+		setFrom(&f.Beta, val, hov)
+	}
+}
+
+func (f *Fundamentals) applyAnalyst(id, val, hov string) {
+	switch id {
+	case "analystRatings", "consensus":
+		f.Consensus = val
+	case "priceTarget":
+		setFrom(&f.PriceTP, val, hov)
+	case "priceTargetChange", "upside":
+		setFrom(&f.UpsidePct, val, hov)
+	}
 }
 
 // Num parses "13.41" / "21.82%" / "776,974,076,972,500" → float64 (0 if n/a).

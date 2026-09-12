@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"github.com/robfig/cron/v3"
 	finapp "indonesia-stock/internal/application/financial"
@@ -13,6 +12,7 @@ import (
 	findomain "indonesia-stock/internal/domain/financial"
 	"indonesia-stock/internal/domain/orderbook"
 	"indonesia-stock/internal/domain/signal"
+	"indonesia-stock/internal/domain/stock"
 	"indonesia-stock/internal/infrastructure/cache"
 	"indonesia-stock/internal/infrastructure/scraper/idx"
 	"indonesia-stock/internal/infrastructure/scraper/rti"
@@ -145,126 +145,69 @@ func outputJSON(v any, compact bool) {
 	_ = enc.Encode(v)
 }
 
-func parseFlags(rest []string, defaults map[string]string) (symbol string, flags map[string]string, compact, jsonOut, csvOut bool) {
-	// manual flag parser: supports flags before or after SYMBOL (AI agents call both forms)
-	jsonOut = true
-	compact = false
-	csvOut = false
-	watchStr := "false"
-	mockStr := "false"
-	debugStr := "false"
-	interval := defaults["interval"]
-	rangeV := defaults["range"]
-	depth := defaults["depth"]
-	period := defaults["period"]
-	typeV := defaults["type"]
-	year := defaults["year"]
-	quarter := defaults["quarter"]
-	zVal := defaults["z"]
-	windowVal := defaults["window"]
-	portVal := defaults["port"]
+// stringFlags accept both "--name value" and "--name=value" forms.
+var stringFlags = []string{"interval", "range", "depth", "period", "type", "year", "quarter", "z", "window", "port"}
 
-	// use std flag for help detection but main parsing is manual
-	fs := flag.NewFlagSet("cmd", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	_ = fs.Parse([]string{}) // dummy to keep import used
+// boolFlags are plain on/off switches.
+var boolFlags = []string{"watch", "mock", "debug", "compact", "csv", "json"}
 
-	args := []string{}
+// parseFlagArgs scans rest into (name → value) with defaults pre-applied.
+// Positional non-flag words are returned separately (first = SYMBOL).
+func parseFlagArgs(rest []string, defaults map[string]string) (symbol string, vals map[string]string, positional []string) {
+	vals = make(map[string]string, len(defaults)+len(boolFlags))
+	for k, v := range defaults {
+		vals[k] = v
+	}
+	for _, b := range boolFlags {
+		if _, ok := vals[b]; !ok {
+			vals[b] = "false"
+		}
+	}
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
-		switch {
-		case a == "--json":
-			jsonOut = true
-		case a == "--json=false" || a == "--json=0":
-			jsonOut = false
-		case a == "--compact":
-			compact = true
-		case a == "--csv":
-			csvOut = true
-		case a == "--watch":
-			watchStr = "true"
-		case a == "--mock":
-			mockStr = "true"
-		case a == "--debug":
-			debugStr = "true"
-		case strings.HasPrefix(a, "--interval="):
-			interval = strings.TrimPrefix(a, "--interval=")
-		case a == "--interval" && i+1 < len(rest):
-			i++
-			interval = rest[i]
-		case strings.HasPrefix(a, "--range="):
-			rangeV = strings.TrimPrefix(a, "--range=")
-		case a == "--range" && i+1 < len(rest):
-			i++
-			rangeV = rest[i]
-		case strings.HasPrefix(a, "--depth="):
-			depth = strings.TrimPrefix(a, "--depth=")
-		case a == "--depth" && i+1 < len(rest):
-			i++
-			depth = rest[i]
-		case strings.HasPrefix(a, "--period="):
-			period = strings.TrimPrefix(a, "--period=")
-		case a == "--period" && i+1 < len(rest):
-			i++
-			period = rest[i]
-		case strings.HasPrefix(a, "--type="):
-			typeV = strings.TrimPrefix(a, "--type=")
-		case a == "--type" && i+1 < len(rest):
-			i++
-			typeV = rest[i]
-		case strings.HasPrefix(a, "--year="):
-			year = strings.TrimPrefix(a, "--year=")
-		case a == "--year" && i+1 < len(rest):
-			i++
-			year = rest[i]
-		case strings.HasPrefix(a, "--quarter="):
-			quarter = strings.TrimPrefix(a, "--quarter=")
-		case a == "--quarter" && i+1 < len(rest):
-			i++
-			quarter = rest[i]
-		case strings.HasPrefix(a, "--z="):
-			zVal = strings.TrimPrefix(a, "--z=")
-		case a == "--z" && i+1 < len(rest):
-			i++
-			zVal = rest[i]
-		case strings.HasPrefix(a, "--window="):
-			windowVal = strings.TrimPrefix(a, "--window=")
-		case a == "--window" && i+1 < len(rest):
-			i++
-			windowVal = rest[i]
-		case strings.HasPrefix(a, "--port="):
-			portVal = strings.TrimPrefix(a, "--port=")
-		case a == "--port" && i+1 < len(rest):
-			i++
-			portVal = rest[i]
-		case strings.HasPrefix(a, "--"):
-			fmt.Fprintf(os.Stderr, "unknown flag %s\n", a)
-		default:
-			if symbol == "" && !strings.HasPrefix(a, "-") {
+		if !strings.HasPrefix(a, "-") {
+			if symbol == "" {
 				symbol = strings.ToUpper(a)
 			} else {
-				args = append(args, a)
+				positional = append(positional, a)
+			}
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		if eq := strings.Index(name, "="); eq != -1 {
+			vals[name[:eq]] = name[eq+1:]
+			continue
+		}
+		for _, known := range append(append([]string{}, stringFlags...), "json") {
+			if name == known && i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
+				i++
+				vals[name] = rest[i]
+				break
+			}
+		}
+		if _, isBool := vals[name]; isBool && !strings.HasPrefix(a, "--json=") {
+			if strings.HasPrefix(a, "--") {
+				vals[name] = "true"
 			}
 		}
 	}
-	_ = args
-	_ = fs
-	flags = map[string]string{
-		"interval": interval,
-		"range":    rangeV,
-		"depth":    depth,
-		"period":   period,
-		"type":     typeV,
-		"year":     year,
-		"quarter":  quarter,
-		"z":        zVal,
-		"window":   windowVal,
-		"port":     portVal,
-		"watch":    watchStr,
-		"mock":     mockStr,
-		"debug":    debugStr,
+	return symbol, vals, positional
+}
+
+func parseFlags(rest []string, defaults map[string]string) (symbol string, flags map[string]string, compact, jsonOut, csvOut bool) {
+	// manual flag parser: supports flags before or after SYMBOL (AI agents call both forms)
+	// Special-case boolean semantics that the generic scanner can't express
+	// (--json=false), then delegate.
+	for _, a := range rest {
+		if a == "--json=false" || a == "--json=0" {
+			defaults["json"] = "false"
+		}
 	}
-	return symbol, flags, compact, jsonOut, csvOut
+	symbol, vals, _ := parseFlagArgs(rest, defaults)
+	jsonOut = vals["json"] != "false"
+	compact = vals["compact"] == "true"
+	csvOut = vals["csv"] == "true"
+	return symbol, vals, compact, jsonOut, csvOut
 }
 
 func runQuote(cfg config.Config, rest []string) int {
@@ -349,9 +292,10 @@ func srcName(fileTok, redisTok *auth.StoredToken) string {
 //	indostock fundamentals BBCA [--compact|--json]
 //	indostock fundamentals BBCA BBRI TLKM
 //	INDOSTOCK_NO_CACHE=1 indostock fundamentals BBCA   (bypass cache)
-func runFundamentals(cfg config.Config, rest []string) int {
-	syms := make([]string, 0, 4)
-	compact := false
+//
+// parseFundArgs splits args into symbols and compact flag.
+func parseFundArgs(rest []string) (syms []string, compact bool) {
+	syms = make([]string, 0, 4)
 	for _, a := range rest {
 		switch {
 		case a == "--compact" || a == "--json" || a == "-c":
@@ -364,29 +308,59 @@ func runFundamentals(cfg config.Config, rest []string) int {
 			}
 		}
 	}
+	return syms, compact
+}
+
+// cachedFundamentals returns the cached fundamentals for sym, or nil.
+func cachedFundamentals(rc *cache.Client, key string) *sa.Fundamentals {
+	if rc == nil {
+		return nil
+	}
+	raw, err := rc.Get(key)
+	if err != nil || raw == "" {
+		return nil
+	}
+	f := &sa.Fundamentals{}
+	if json.Unmarshal([]byte(raw), f) != nil || f.PE == "" {
+		return nil
+	}
+	return f
+}
+
+// printOrEmit outputs f as compact JSON or a human table.
+func printOrEmit(f *sa.Fundamentals, compact bool, raw string) {
+	if compact {
+		if raw == "" {
+			b, _ := json.Marshal(f)
+			raw = string(b)
+		}
+		fmt.Println(raw)
+		return
+	}
+	printFundamentals(f)
+}
+
+func runFundamentals(cfg config.Config, rest []string) int {
+	syms, compact := parseFundArgs(rest)
 	if len(syms) == 0 {
 		fmt.Fprintln(os.Stderr, "fundamentals: need SYMBOL, e.g. indostock fundamentals BBCA")
 		return 1
 	}
 	noCache := os.Getenv("INDOSTOCK_NO_CACHE") == "1"
 	client := sa.New()
-	rc := cache.New(cfg.RedisURL)
-	rcOK := rc.Available() && !noCache
+	var rc *cache.Client
+	if !noCache {
+		rc = cache.New(cfg.RedisURL)
+	}
+	rcOK := rc != nil && rc.Available()
 
 	exit := 0
 	for _, sym := range syms {
 		key := "indostock:fundamentals:" + sym
 		if rcOK {
-			if raw, gerr := rc.Get(key); gerr == nil && raw != "" {
-				f := &sa.Fundamentals{}
-				if jerr := json.Unmarshal([]byte(raw), f); jerr == nil && f.PE != "" {
-					if compact {
-						fmt.Println(raw)
-					} else {
-						printFundamentals(f)
-					}
-					continue
-				}
+			if f := cachedFundamentals(rc, key); f != nil {
+				printOrEmit(f, compact, "")
+				continue
 			}
 		}
 		f, err := client.FetchStatistics(sym)
@@ -1014,6 +988,125 @@ func runRegime(cfg config.Config, rest []string) int {
 	return 0
 }
 
+// candleMap converts domain candles to the map shape used by calcATR/EMA.
+func candleMap(cs []stock.Candle) []map[string]any {
+	hist := make([]map[string]any, 0, len(cs))
+	for _, c := range cs {
+		hist = append(hist, map[string]any{"high": c.High, "low": c.Low, "close": c.Close})
+	}
+	return hist
+}
+
+// volumeStats computes (mean, std, z, relPct) of the latest volume vs the
+// trailing window (Sonar: complexity — shared by whale & signal paths).
+func volumeStats(vols []float64, latestVol int64) (mean, std, z, relPct float64) {
+	mean, std = meanStd(vols)
+	if std > 0 {
+		z = (float64(latestVol) - mean) / std
+	}
+	if mean > 0 {
+		relPct = float64(latestVol) / mean * 100
+	}
+	return mean, std, z, relPct
+}
+
+// trailingVolumes collects up to 60 volumes before the latest entry.
+func trailingVolumes(candles []map[string]any) []float64 {
+	var vols []float64
+	for i := len(candles) - 61; i < len(candles)-1; i++ {
+		if i < 0 {
+			continue
+		}
+		switch v := candles[i]["volume"].(type) {
+		case int64:
+			vols = append(vols, float64(v))
+		case float64:
+			vols = append(vols, v)
+		}
+	}
+	return vols
+}
+
+// regimeFromMetrics maps ATR%/EMA-slope onto a regime label.
+func regimeFromMetrics(atrPct, emaSlope float64) signal.Regime {
+	if atrPct > 2.0 {
+		return signal.RegimeVolatile
+	}
+	if math.Abs(emaSlope) > 0.5 {
+		return signal.RegimeTrending
+	}
+	return signal.RegimeRanging
+}
+
+// decideSignal combines whale + regime + orderflow into a decision.
+func decideSignal(whaleRes signal.WhaleResult, regimeRes signal.RegimeResult, imbalance, changePct float64) (signal.SignalDecision, float64, string) {
+	decision := signal.DecisionWait
+	conf := 0.55
+	reason := "no strong signal"
+	switch {
+	case whaleRes.IsWhale && regimeRes.Regime == signal.RegimeTrending && imbalance > 0.2 && changePct > 1:
+		decision, conf, reason = signal.DecisionBuy, 0.78, "whale + trending + bid dominance"
+	case whaleRes.IsWhale && regimeRes.Regime == signal.RegimeVolatile:
+		decision, conf, reason = signal.DecisionNoTrade, 0.3, "whale but volatile regime - fakeout risk"
+	case imbalance > 0.3 && whaleRes.IsWhale:
+		decision, conf, reason = signal.DecisionBuy, 0.65, "whale + bid dominance"
+	case imbalance < -0.3:
+		decision, conf, reason = signal.DecisionNoTrade, 0.4, "ask dominance"
+	}
+	return decision, conf, reason
+}
+
+// gatherMockInputs fills whale/regime/imbalance/change from mock generators.
+func gatherMockInputs(symbol string) (signal.WhaleResult, signal.RegimeResult, float64, float64) {
+	hist := mockHistory(symbol, "1d", "3mo")
+	vols := trailingVolumes(hist)
+	latestVol, _ := hist[len(hist)-1]["volume"].(int64)
+	mean, std, z, relPct := volumeStats(vols, latestVol)
+	whaleRes := signal.WhaleResult{Symbol: symbol, Volume: latestVol, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: z >= 3.0 || relPct >= 500}
+	atr, atrPct := calcATR(hist, 14)
+	emaSlope := calcEMASlope(hist, 20)
+	regimeRes := signal.RegimeResult{Symbol: symbol, Regime: regimeFromMetrics(atrPct, emaSlope), ATR: atr, ATRPercent: atrPct, EMASlopePct: emaSlope}
+	ob := mockOrderbook(symbol, 10)
+	q := mockQuote(symbol)
+	return whaleRes, regimeRes, ob.Imbalance().Ratio, q["change_pct"].(float64)
+}
+
+// gatherLiveInputs fills whale/regime/imbalance/change from live services.
+func gatherLiveInputs(cfg config.Config, symbol string) (signal.WhaleResult, signal.RegimeResult, float64, float64, error) {
+	yClient := yahoo.New(cfg.YahooBaseURL)
+	qSvc := quote.New(yClient)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cs, err := qSvc.GetHistory(ctx, symbol, "1d", "3mo")
+	if err != nil {
+		return signal.WhaleResult{}, signal.RegimeResult{}, 0, 0, err
+	}
+	latest := cs[len(cs)-1]
+	vols := make([]float64, 0, 60)
+	for i := len(cs) - 61; i < len(cs)-1; i++ {
+		if i >= 0 {
+			vols = append(vols, float64(cs[i].Volume))
+		}
+	}
+	mean, std, z, relPct := volumeStats(vols, latest.Volume)
+	whaleRes := signal.WhaleResult{Symbol: symbol, Volume: latest.Volume, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: z >= 3.0 || relPct >= 500}
+	hist := candleMap(cs)
+	atr, atrPct := calcATR(hist, 14)
+	emaSlope := calcEMASlope(hist, 20)
+	regimeRes := signal.RegimeResult{Symbol: symbol, Regime: regimeFromMetrics(atrPct, emaSlope), ATR: atr, ATRPercent: atrPct, EMASlopePct: emaSlope}
+	sClient := stockbit.New(cfg.StockbitBaseURL, cfg.StockbitToken)
+	sClient.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
+	obSvc := orderbookapp.New(sClient)
+	var imbalance, changePct float64
+	if ob, err := obSvc.Get(ctx, symbol); err == nil {
+		imbalance = ob.Imbalance().Ratio
+	}
+	if q, _ := qSvc.GetQuote(ctx, symbol); q != nil {
+		changePct = q.ChangePct
+	}
+	return whaleRes, regimeRes, imbalance, changePct, nil
+}
+
 func runSignal(cfg config.Config, rest []string) int {
 	symbol, flags, compact, _, _ := parseFlags(rest, map[string]string{"z": "3.0"})
 	if symbol == "" {
@@ -1021,132 +1114,20 @@ func runSignal(cfg config.Config, rest []string) int {
 		return 1
 	}
 	mock := flags["mock"] == "true"
-	// gather whale, regime, orderbook, quote
-	// use internal helpers without extra network
 	var whaleRes signal.WhaleResult
 	var regimeRes signal.RegimeResult
-	var imbalance float64
-	var changePct float64
+	var imbalance, changePct float64
 	if mock {
-		// whale
-		hist := mockHistory(symbol, "1d", "3mo")
-		var vols []float64
-		for i := len(hist) - 61; i < len(hist)-1; i++ {
-			if i < 0 {
-				continue
-			}
-			if v, ok := hist[i]["volume"].(int64); ok {
-				vols = append(vols, float64(v))
-			}
-		}
-		mean, std := meanStd(vols)
-		latestVol := hist[len(hist)-1]["volume"].(int64)
-		// Sonar: math/rand is fine for mock data, but silently inflating the
-		// latest volume 15% of the time made mock whale signals
-		// nondeterministic. Mock whale now comes from the data itself
-		// (mockHistory already randomizes volumes); no hidden multiplier.
-		z := 0.0
-		if std > 0 {
-			z = (float64(latestVol) - mean) / std
-		}
-		relPct := 0.0
-		if mean > 0 {
-			relPct = float64(latestVol) / mean * 100
-		}
-		isWhale := z >= 3.0 || relPct >= 500
-		whaleRes = signal.WhaleResult{Symbol: symbol, Volume: latestVol, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: isWhale}
-		// regime
-		atr, atrPct := calcATR(hist, 14)
-		emaSlope := calcEMASlope(hist, 20)
-		reg := signal.RegimeRanging
-		if atrPct > 2.0 {
-			reg = signal.RegimeVolatile
-		} else if math.Abs(emaSlope) > 0.5 {
-			reg = signal.RegimeTrending
-		}
-		regimeRes = signal.RegimeResult{Symbol: symbol, Regime: reg, ATR: atr, ATRPercent: atrPct, EMASlopePct: emaSlope}
-		// orderbook imbalance
-		ob := mockOrderbook(symbol, 10)
-		imb := ob.Imbalance()
-		imbalance = imb.Ratio
-		q := mockQuote(symbol)
-		changePct = q["change_pct"].(float64)
+		whaleRes, regimeRes, imbalance, changePct = gatherMockInputs(symbol)
 	} else {
-		// live: fetch via services
-		yClient := yahoo.New(cfg.YahooBaseURL)
-		qSvc := quote.New(yClient)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		cs, err := qSvc.GetHistory(ctx, symbol, "1d", "3mo")
+		var err error
+		whaleRes, regimeRes, imbalance, changePct, err = gatherLiveInputs(cfg, symbol)
 		if err != nil {
 			outputJSON(map[string]any{"error": err.Error()}, compact)
 			return 1
 		}
-		var vols []float64
-		for i := len(cs) - 61; i < len(cs)-1; i++ {
-			if i < 0 {
-				continue
-			}
-			vols = append(vols, float64(cs[i].Volume))
-		}
-		mean, std := meanStd(vols)
-		latestVol := cs[len(cs)-1].Volume
-		z := 0.0
-		if std > 0 {
-			z = (float64(latestVol) - mean) / std
-		}
-		relPct := 0.0
-		if mean > 0 {
-			relPct = float64(latestVol) / mean * 100
-		}
-		whaleRes = signal.WhaleResult{Symbol: symbol, Volume: latestVol, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: z >= 3.0 || relPct >= 500}
-		// regime from live candles
-		var hist []map[string]any
-		for _, c := range cs {
-			hist = append(hist, map[string]any{"high": c.High, "low": c.Low, "close": c.Close})
-		}
-		atr, atrPct := calcATR(hist, 14)
-		emaSlope := calcEMASlope(hist, 20)
-		reg := signal.RegimeRanging
-		if atrPct > 2.0 {
-			reg = signal.RegimeVolatile
-		} else if math.Abs(emaSlope) > 0.5 {
-			reg = signal.RegimeTrending
-		}
-		regimeRes = signal.RegimeResult{Symbol: symbol, Regime: reg, ATR: atr, ATRPercent: atrPct, EMASlopePct: emaSlope}
-		// orderbook live
-		sClient := stockbit.New(cfg.StockbitBaseURL, cfg.StockbitToken)
-		sClient.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
-		obSvc := orderbookapp.New(sClient)
-		ob, err := obSvc.Get(ctx, symbol)
-		if err == nil {
-			imbalance = ob.Imbalance().Ratio
-		}
-		q, _ := qSvc.GetQuote(ctx, symbol)
-		if q != nil {
-			changePct = q.ChangePct
-		}
 	}
-	decision := signal.DecisionWait
-	conf := 0.55
-	reason := "no strong signal"
-	if whaleRes.IsWhale && regimeRes.Regime == signal.RegimeTrending && imbalance > 0.2 && changePct > 1 {
-		decision = signal.DecisionBuy
-		conf = 0.78
-		reason = "whale + trending + bid dominance"
-	} else if whaleRes.IsWhale && regimeRes.Regime == signal.RegimeVolatile {
-		decision = signal.DecisionNoTrade
-		conf = 0.3
-		reason = "whale but volatile regime - fakeout risk"
-	} else if imbalance > 0.3 && whaleRes.IsWhale {
-		decision = signal.DecisionBuy
-		conf = 0.65
-		reason = "whale + bid dominance"
-	} else if imbalance < -0.3 {
-		decision = signal.DecisionNoTrade
-		conf = 0.4
-		reason = "ask dominance"
-	}
+	decision, conf, reason := decideSignal(whaleRes, regimeRes, imbalance, changePct)
 	if mock {
 		whaleRes.Source = "mock"
 		regimeRes.Source = "mock"
@@ -1241,6 +1222,91 @@ func toFloatCandles(v any) float64 {
 	}
 }
 
+// restoreSession validates the stored token at startup: valid → log, near
+// expiry → rotate, unusable → seed Redis from token.json (Sonar: cognitive
+// complexity — extracted from runServe).
+func restoreSession(rc *cache.Client) {
+	if !rc.Available() {
+		fmt.Fprintln(os.Stderr, "redis: tidak tersedia, fallback ke file token.json")
+		return
+	}
+	// prefer token.json (single source of truth); Redis cache only helps
+	// if the file is unreadable. Rotation itself is lock-serialized
+	// inside auth.Refresh().
+	var tfTok *auth.StoredToken
+	if tf := auth.FindTokenFile(); tf != "" {
+		if tt, err := auth.LoadFrom(tf); err == nil && tt.AccessToken != "" {
+			tfTok = tt
+		}
+	}
+	rt, _ := auth.LoadFromRedis(rc)
+	src := tfTok
+	if src == nil {
+		src = rt
+	}
+	switch {
+	case src != nil && src.AccessToken != "" && !auth.IsExpired(src, 5*time.Minute):
+		fmt.Fprintf(os.Stderr, "session valid expires=%s remaining=%v (src=%s)\n", src.ExpiresAt.Format(time.RFC3339), time.Until(src.ExpiresAt).Round(time.Second), srcName(tfTok, rt))
+	case src != nil && src.AccessToken != "" && src.RefreshToken != "":
+		fmt.Fprintln(os.Stderr, "session hampir expired, rotate...")
+		if nt, err := auth.Refresh(src); err == nil {
+			_ = auth.SaveToRedis(rc, nt)
+			_ = auth.Save(nt, "")
+			fmt.Fprintf(os.Stderr, "rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
+		} else {
+			fmt.Fprintf(os.Stderr, "rotate gagal: %v\n", err)
+		}
+	case src != nil && src.AccessToken != "":
+		fmt.Fprintln(os.Stderr, "session expired tanpa refresh_token, butuh indostock auth save")
+	case tfTok == nil && rt == nil:
+		// nothing usable anywhere: seed redis from file if it has AT only
+		if t, err := auth.Load(); err == nil && t.AccessToken != "" {
+			_ = auth.SaveToRedis(rc, t)
+			fmt.Fprintf(os.Stderr, "redis: seeded dari file expires=%s\n", t.ExpiresAt.Format(time.RFC3339))
+		}
+	}
+}
+
+// loadCronToken picks the freshest stored token for the hourly cron: Redis
+// first, falling back to token.json (source of truth — Sonar complexity
+// extraction).
+func loadCronToken(rc *cache.Client) *auth.StoredToken {
+	if rc.Available() {
+		if tt, err := auth.LoadFromRedis(rc); err == nil && tt != nil && tt.RefreshToken != "" {
+			return tt
+		}
+	}
+	if p := auth.FindTokenFile(); p != "" {
+		if tt, err := auth.LoadFrom(p); err == nil && tt != nil && tt.RefreshToken != "" {
+			log.Printf("cron: redis key missing/expired, using token.json (rt until %s)", rtBatteryStr(tt))
+			return tt
+		}
+	}
+	return nil
+}
+
+func rtBatteryStr(t *auth.StoredToken) string {
+	if e, _ := auth.RTBattery(t); !e.IsZero() {
+		return e.Format(time.RFC3339)
+	}
+	return "unknown"
+}
+
+// rotateIfExpiring refreshes the token when it will expire within 30m.
+func rotateIfExpiring(rc *cache.Client, t *auth.StoredToken) {
+	if !auth.IsExpired(t, 30*time.Minute) {
+		return
+	}
+	log.Printf("cron: token will expire in %v, refreshing...", time.Until(t.ExpiresAt))
+	if nt, err := auth.Refresh(t); err == nil {
+		_ = auth.SaveToRedis(rc, nt)
+		_ = auth.Save(nt, "")
+		log.Printf("cron: refreshed new expiry %s", nt.ExpiresAt.Format(time.RFC3339))
+	} else {
+		log.Printf("cron: refresh failed: %v", err)
+	}
+}
+
 func runServe(cfg config.Config, rest []string) int {
 	_, flags, _, _, _ := parseFlags(rest, map[string]string{"port": cfg.Port})
 	port := cfg.Port
@@ -1249,47 +1315,7 @@ func runServe(cfg config.Config, rest []string) int {
 	}
 	// Redis session: saat start cek redis, jika valid pakai, jika hampir expired rotate via refresh
 	rc := cache.New(cfg.RedisURL)
-	if rc.Available() {
-		// prefer token.json (single source of truth); Redis cache only helps
-		// if the file is unreadable. Rotation itself is lock-serialized
-		// inside auth.Refresh().
-		tf := auth.FindTokenFile()
-		var tfTok *auth.StoredToken
-		if tf != "" {
-			if tt, err := auth.LoadFrom(tf); err == nil && tt.AccessToken != "" {
-				tfTok = tt
-			}
-		}
-		rt, _ := auth.LoadFromRedis(rc)
-		src := tfTok
-		if src == nil {
-			src = rt
-		}
-		if src != nil && src.AccessToken != "" {
-			if !auth.IsExpired(src, 5*time.Minute) {
-				fmt.Fprintf(os.Stderr, "session valid expires=%s remaining=%v (src=%s)\n", src.ExpiresAt.Format(time.RFC3339), time.Until(src.ExpiresAt).Round(time.Second), srcName(tfTok, rt))
-			} else if src.RefreshToken != "" {
-				fmt.Fprintln(os.Stderr, "session hampir expired, rotate...")
-				if nt, err := auth.Refresh(src); err == nil {
-					_ = auth.SaveToRedis(rc, nt)
-					_ = auth.Save(nt, "")
-					fmt.Fprintf(os.Stderr, "rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
-				} else {
-					fmt.Fprintf(os.Stderr, "rotate gagal: %v\n", err)
-				}
-			} else {
-				fmt.Fprintln(os.Stderr, "session expired tanpa refresh_token, butuh indostock auth save")
-			}
-		} else if tfTok == nil {
-			// nothing usable anywhere: seed redis from file if it has AT only
-			if t, err := auth.Load(); err == nil && t.AccessToken != "" {
-				_ = auth.SaveToRedis(rc, t)
-				fmt.Fprintf(os.Stderr, "redis: seeded dari file expires=%s\n", t.ExpiresAt.Format(time.RFC3339))
-			}
-		}
-	} else {
-		fmt.Fprintln(os.Stderr, "redis: tidak tersedia, fallback ke file token.json")
-	}
+	restoreSession(rc)
 	// Cron in-process: cek tiap jam, rotate jika <30m mau expired, dan tiap hari 04:00 WIB paksa cek
 	wib, _ := time.LoadLocation("Asia/Jakarta")
 	if wib == nil {
@@ -1302,37 +1328,8 @@ func runServe(cfg config.Config, rest []string) int {
 		// If the Redis key expired (e.g. service down > 24h) we MUST fall
 		// back to the file — otherwise the healthy refresh token in the
 		// file quietly rots to death while cron "returns" every hour.
-		var t *auth.StoredToken
-		if rc2.Available() {
-			if tt, err := auth.LoadFromRedis(rc2); err == nil && tt != nil && tt.RefreshToken != "" {
-				t = tt
-			}
-		}
-		if t == nil {
-			if p := auth.FindTokenFile(); p != "" {
-				if tt, err := auth.LoadFrom(p); err == nil && tt != nil && tt.RefreshToken != "" {
-					t = tt
-					log.Printf("cron: redis key missing/expired, using token.json (rt until %s)", func() string {
-						if e, _ := auth.RTBattery(tt); !e.IsZero() {
-							return e.Format(time.RFC3339)
-						}
-						return "unknown"
-					}())
-				}
-			}
-		}
-		if t == nil {
-			return
-		}
-		if auth.IsExpired(t, 30*time.Minute) {
-			log.Printf("cron: token will expire in %v, refreshing...", time.Until(t.ExpiresAt))
-			if nt, err := auth.Refresh(t); err == nil {
-				_ = auth.SaveToRedis(rc2, nt)
-				_ = auth.Save(nt, "")
-				log.Printf("cron: refreshed new expiry %s", nt.ExpiresAt.Format(time.RFC3339))
-			} else {
-				log.Printf("cron: refresh failed: %v", err)
-			}
+		if t := loadCronToken(rc2); t != nil {
+			rotateIfExpiring(rc2, t)
 		}
 	})
 	c.Start()
