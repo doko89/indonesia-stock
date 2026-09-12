@@ -465,17 +465,20 @@ func waitForPeerRotation(t *StoredToken) (*StoredToken, func(), bool) {
 	for i := 0; i < 12; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" && cur.RefreshToken != t.RefreshToken {
-			// release is a no-op here: we never held the lock, the
-			// owning peer will release it themselves.
-			return cur, func() {}, true // peer's rotation produced a new pair; adopt it
+			// peer's rotation produced a new pair; adopt it
+			return cur, func() {
+				// no-op release: we never held the lock, the owning
+				// peer releases it themselves
+			}, true
 		}
 		if locked, r2 := acquireRefreshLock(); locked {
 			return nil, r2, false // we got the lock; caller proceeds to rotate
 		}
 	}
-	// release is a no-op: the caller only proceeds to rotate when locked
-	// is true; a false return means the caller never holds any lock.
-	return nil, func() {}, false
+	// caller never holds any lock here, so release must stay a no-op
+	return nil, func() {
+		// no-op release: lock was never acquired on this code path
+	}, false
 }
 
 // buildRotatedToken maps the refresh response onto a StoredToken with expiry
@@ -676,7 +679,9 @@ func acquireRefreshLock() (bool, func()) {
 			return true, func() { l.Unlock(id) }
 		}
 		// no-op unlock: lock not acquired, nothing to release
-		return false, func() {}
+		return false, func() {
+			// no-op: Redis lock belongs to the peer that holds it
+		}
 	}
 	// file fallback
 	return acquireFileLock()
@@ -715,7 +720,9 @@ func acquireFileLock() (bool, func()) {
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		// no-op unlock: lock not acquired, nothing to release
-		return false, func() {}
+		return false, func() {
+			// no-op: another process owns the lockfile
+		}
 	}
 	return true, func() {
 		f.Close()
