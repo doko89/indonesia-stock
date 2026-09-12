@@ -784,6 +784,13 @@ func buildAnalysis(quoteRes, obRes any) any {
 	}
 }
 
+// mockOrderbook, mockQuote and mockHistory generate synthetic offline
+// fixtures for --mock mode only (prices, lots, volumes). They never mint
+// tokens, IDs, or anything security-sensitive, so switching to crypto/rand
+// would only churn fixture output for no benefit. Behavior intentionally
+// unchanged.
+//
+//nolint:gosec // G404: math/rand use is safe here (non-security mock data).
 func mockOrderbook(symbol string, depth int) *orderbook.Orderbook {
 	if depth <= 0 {
 		depth = 10
