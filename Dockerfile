@@ -6,7 +6,10 @@ COPY . .
 RUN GOCACHE=/tmp/gocache go build -o /bin/indostock ./cmd/indostock
 
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates \
+ && addgroup -S indostock \
+ && adduser -S -G indostock indostock
 COPY --from=builder /bin/indostock /bin/indostock
+USER indostock
 EXPOSE 8080
 ENTRYPOINT ["/bin/indostock"]

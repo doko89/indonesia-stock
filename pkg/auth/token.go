@@ -552,15 +552,37 @@ func acquireRefreshLock() (bool, func()) {
 	return acquireFileLock()
 }
 
+// lockDir returns a per-user, non-world-writable directory for the refresh
+// lock. /tmp is shared across users (Sonar hotspot: publicly writable dir) —
+// another local user could pre-create/DoS the lock there. XDG cache dir is
+// 0700 and only ours.
+func lockDir() string {
+	if v := os.Getenv("XDG_CACHE_HOME"); v != "" {
+		_ = os.MkdirAll(filepath.Join(v, "indostock"), 0o700)
+		return filepath.Join(v, "indostock")
+	}
+	if base, err := os.UserCacheDir(); err == nil {
+		_ = os.MkdirAll(filepath.Join(base, "indostock"), 0o700)
+		return filepath.Join(base, "indostock")
+	}
+	// last resort: home-relative, never world-writable
+	if home, err := os.UserHomeDir(); err == nil {
+		p := filepath.Join(home, ".cache", "indostock")
+		_ = os.MkdirAll(p, 0o700)
+		return p
+	}
+	return "."
+}
+
 func acquireFileLock() (bool, func()) {
-	lockPath := "/tmp/indostock_refresh.lock"
+	lockPath := filepath.Join(lockDir(), "refresh.lock")
 	// stale detection: if lockfile older than 30s, remove
 	if fi, err := os.Stat(lockPath); err == nil {
 		if time.Since(fi.ModTime()) > 30*time.Second {
 			_ = os.Remove(lockPath)
 		}
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0600)
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return false, func() {}
 	}

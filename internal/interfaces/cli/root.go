@@ -895,9 +895,9 @@ func runWhale(cfg config.Config, rest []string) int {
 				latestVol = v
 			}
 		}
-		if rand.Float64() < 0.15 {
-			latestVol = latestVol * 6
-		}
+		// Sonar: no hidden random multiplier — mock volumes are already
+		// randomized by mockHistory, whale detection must stay deterministic
+		// on a given dataset.
 	} else {
 		client := yahoo.New(cfg.YahooBaseURL)
 		svc := quote.New(client)
@@ -1041,9 +1041,10 @@ func runSignal(cfg config.Config, rest []string) int {
 		}
 		mean, std := meanStd(vols)
 		latestVol := hist[len(hist)-1]["volume"].(int64)
-		if rand.Float64() < 0.15 {
-			latestVol *= 6
-		}
+		// Sonar: math/rand is fine for mock data, but silently inflating the
+		// latest volume 15% of the time made mock whale signals
+		// nondeterministic. Mock whale now comes from the data itself
+		// (mockHistory already randomizes volumes); no hidden multiplier.
 		z := 0.0
 		if std > 0 {
 			z = (float64(latestVol) - mean) / std

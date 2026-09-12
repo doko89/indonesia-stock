@@ -192,8 +192,10 @@ func Load() Config {
 		IDXBaseURL:      env("IDX_BASE_URL", "https://www.idx.co.id"),
 		LogLevel:        env("LOG_LEVEL", "info"),
 		RedisURL:        env("REDIS_URL", "redis://localhost:6379/0"),
-		DatabaseURL:     env("DATABASE_URL", "postgres://indostock:indostock@localhost:5432/indostock?sslmode=disable"),
+		// no default DSN with a password: require env (Sonar: hardcoded credential)
+		DatabaseURL: env("DATABASE_URL", ""),
 	}
+}
 }
 
 func env(k, fallback string) string {
