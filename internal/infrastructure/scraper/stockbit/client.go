@@ -130,6 +130,21 @@ func parseStockbitBody(body []byte, symbol string) (*orderbook.Orderbook, error)
 	return out, nil
 }
 
+// findInValue searches one JSON value (object or array) for the keys.
+func findInValue(v any, keys []string) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return findDeep(t, keys)
+	case []any:
+		for _, el := range t {
+			if found := findInValue(el, keys); found != nil {
+				return found
+			}
+		}
+	}
+	return nil
+}
+
 func findDeep(m map[string]any, keys []string) any {
 	for _, k := range keys {
 		if v, ok := m[k]; ok {
@@ -137,19 +152,8 @@ func findDeep(m map[string]any, keys []string) any {
 		}
 	}
 	for _, v := range m {
-		if sub, ok := v.(map[string]any); ok {
-			if found := findDeep(sub, keys); found != nil {
-				return found
-			}
-		}
-		if arr, ok := v.([]any); ok {
-			for _, el := range arr {
-				if sub, ok := el.(map[string]any); ok {
-					if found := findDeep(sub, keys); found != nil {
-						return found
-					}
-				}
-			}
+		if found := findInValue(v, keys); found != nil {
+			return found
 		}
 	}
 	return nil

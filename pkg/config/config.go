@@ -204,18 +204,33 @@ func env(k, fallback string) string {
 	return fallback
 }
 
+// jwtFromTokenFile extracts a bare access_token JWT from a token.json file.
+func jwtFromTokenFile(p string) string {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	s := string(b)
+	if len(s) <= 20 {
+		return ""
+	}
+	var j map[string]any
+	if json.Unmarshal(b, &j) != nil {
+		return ""
+	}
+	v, ok := j["access_token"].(string)
+	if !ok || len(v) <= 50 {
+		return ""
+	}
+	return v
+}
+
+// tokenFromFile locates the stored access token across known file locations.
+// Used only for legacy/config bootstrap; runtime auth uses pkg/auth.
 func tokenFromFile() string {
 	for _, p := range auth.TokenFileCandidates() {
-		if b, err := os.ReadFile(p); err == nil {
-			s := string(b)
-			if len(s) > 20 {
-				var j map[string]any
-				if json.Unmarshal(b, &j) == nil {
-					if v, ok := j["access_token"].(string); ok && len(v) > 50 {
-						return v
-					}
-				}
-			}
+		if v := jwtFromTokenFile(p); v != "" {
+			return v
 		}
 	}
 	candidates := []string{

@@ -153,8 +153,37 @@ var boolFlags = []string{"watch", "mock", "debug", "compact", "csv", "json"}
 
 // parseFlagArgs scans rest into (name → value) with defaults pre-applied.
 // Positional non-flag words are returned separately (first = SYMBOL).
-func parseFlagArgs(rest []string, defaults map[string]string) (symbol string, vals map[string]string, positional []string) {
-	vals = make(map[string]string, len(defaults)+len(boolFlags))
+// isStringFlag reports whether name is a string-valued flag, i.e. it consumes
+// the next non-flag token as its value.
+func isStringFlag(name, next string, nextExists bool) bool {
+	if !nextExists || strings.HasPrefix(next, "-") {
+		return false
+	}
+	if name == "json" {
+		return true // --json <bool> is accepted alongside --json=false
+	}
+	for _, known := range stringFlags {
+		if name == known {
+			return true
+		}
+	}
+	return false
+}
+
+// applyBoolFlag marks a boolean flag as true for the long "--flag" form.
+// The explicit "--json=false" form is handled at parseFlags level, not here.
+func applyBoolFlag(a, name string, vals map[string]string) {
+	if strings.HasPrefix(a, "--json=") || !strings.HasPrefix(a, "--") {
+		return
+	}
+	if _, isBool := vals[name]; isBool {
+		vals[name] = "true"
+	}
+}
+
+// initFlagVals seeds vals with defaults then boolean false defaults.
+func initFlagVals(defaults map[string]string) map[string]string {
+	vals := make(map[string]string, len(defaults)+len(boolFlags))
 	for k, v := range defaults {
 		vals[k] = v
 	}
@@ -163,6 +192,12 @@ func parseFlagArgs(rest []string, defaults map[string]string) (symbol string, va
 			vals[b] = "false"
 		}
 	}
+	return vals
+}
+
+// scanTokens walks args, filling vals/symbol/positional. string-value flags
+// consume the following token; booleans flip on the long "--flag" form.
+func scanTokens(rest []string, vals map[string]string) (symbol string, positional []string) {
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		if !strings.HasPrefix(a, "-") {
@@ -178,24 +213,24 @@ func parseFlagArgs(rest []string, defaults map[string]string) (symbol string, va
 			vals[name[:eq]] = name[eq+1:]
 			continue
 		}
-		consumed := false
-		for _, known := range append(append([]string{}, stringFlags...), "json") {
-			if name == known && i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
-				i++
-				vals[name] = rest[i]
-				consumed = true
-				break
-			}
+		nextExists := i+1 < len(rest)
+		var next string
+		if nextExists {
+			next = rest[i+1]
 		}
-		if consumed {
+		if isStringFlag(name, next, nextExists) {
+			i++
+			vals[name] = next
 			continue // string flag took its value; never treat as boolean
 		}
-		if _, isBool := vals[name]; isBool && !strings.HasPrefix(a, "--json=") {
-			if strings.HasPrefix(a, "--") {
-				vals[name] = "true"
-			}
-		}
+		applyBoolFlag(a, name, vals)
 	}
+	return symbol, positional
+}
+
+func parseFlagArgs(rest []string, defaults map[string]string) (string, map[string]string, []string) {
+	vals := initFlagVals(defaults)
+	symbol, positional := scanTokens(rest, vals)
 	return symbol, vals, positional
 }
 
@@ -345,6 +380,20 @@ func printOrEmit(f *sa.Fundamentals, compact bool, raw string) {
 	printFundamentals(f)
 }
 
+// fetchAndCacheFundamentals fetches fresh data for sym and populates the cache.
+func fetchAndCacheFundamentals(client *sa.Client, rc *cache.Client, key, sym string, rcOK bool) (*sa.Fundamentals, error) {
+	f, err := client.FetchStatistics(sym)
+	if err != nil {
+		return nil, err
+	}
+	if rcOK {
+		if b, jerr := json.Marshal(f); jerr == nil {
+			_ = rc.SetEx(key, string(b), 24*time.Hour)
+		}
+	}
+	return f, nil
+}
+
 func runFundamentals(cfg config.Config, rest []string) int {
 	syms, compact := parseFundArgs(rest)
 	if len(syms) == 0 {
@@ -368,23 +417,13 @@ func runFundamentals(cfg config.Config, rest []string) int {
 				continue
 			}
 		}
-		f, err := client.FetchStatistics(sym)
+		f, err := fetchAndCacheFundamentals(client, rc, key, sym, rcOK)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "fundamentals %s: %v\n", sym, err)
 			exit = 1
 			continue
 		}
-		if rcOK {
-			if b, jerr := json.Marshal(f); jerr == nil {
-				_ = rc.SetEx(key, string(b), 24*time.Hour)
-			}
-		}
-		if compact {
-			b, _ := json.Marshal(f)
-			fmt.Println(string(b))
-		} else {
-			printFundamentals(f)
-		}
+		printOrEmit(f, compact, "")
 	}
 	return exit
 }
@@ -414,6 +453,41 @@ func printFundamentals(f *sa.Fundamentals) {
 	}
 }
 
+// clipDepth trims bids/asks to the requested depth (0 = no clipping).
+func clipDepth[T ~[]E, E any](levels T, depth int) T {
+	if depth <= 0 || len(levels) <= depth {
+		return levels
+	}
+	return levels[:depth]
+}
+
+// runOrderbookMock serves the mock orderbook once, or loops in watch mode.
+func runOrderbookMock(symbol string, depth, interval int, watch, compact bool) {
+	if watch {
+		ticker := time.NewTicker(time.Duration(interval) * time.Second)
+		defer ticker.Stop()
+		for {
+			ob := mockOrderbook(symbol, depth)
+			outputJSON(enrichOrderbook(ob), true)
+			<-ticker.C
+		}
+	}
+	ob := mockOrderbook(symbol, depth)
+	outputJSON(enrichOrderbook(ob), compact)
+}
+
+// orderbookErrorHint builds the actionable error payload for auth failures.
+func orderbookErrorHint(err error, symbol string, tokenSet bool, compact bool) {
+	hint := "save tokens from browser login via 'indostock auth save --token <JWT> --refresh <JWT> (or --stdin), then indostock auth status --json to verify.' (ADR-0009)"
+	if !tokenSet {
+		hint += " | ADR-0009: server logins trigger OTP and fail; use browser token capture"
+	}
+	outputJSON(map[string]any{
+		"error": err.Error(), "symbol": symbol, "hint": hint,
+		"endpoint": "https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/" + symbol,
+	}, compact)
+}
+
 func runOrderbook(cfg config.Config, rest []string) int {
 	symbol, flags, compact, _, _ := parseFlags(rest, map[string]string{"interval": "2", "depth": "10"})
 	if symbol == "" {
@@ -422,23 +496,12 @@ func runOrderbook(cfg config.Config, rest []string) int {
 	}
 	depth := 10
 	fmt.Sscan(flags["depth"], &depth)
-	watch := flags["watch"] == "true"
 	mock := flags["mock"] == "true"
 	interval := 2
 	fmt.Sscan(flags["interval"], &interval)
 
 	if mock {
-		if watch {
-			ticker := time.NewTicker(time.Duration(interval) * time.Second)
-			defer ticker.Stop()
-			for {
-				ob := mockOrderbook(symbol, depth)
-				outputJSON(enrichOrderbook(ob), true)
-				<-ticker.C
-			}
-		}
-		ob := mockOrderbook(symbol, depth)
-		outputJSON(enrichOrderbook(ob), compact)
+		runOrderbookMock(symbol, depth, interval, flags["watch"] == "true", compact)
 		return 0
 	}
 
@@ -446,27 +509,8 @@ func runOrderbook(cfg config.Config, rest []string) int {
 	client.OnAuthRejected = func() string { tok, _ := auth.ForceRefresh(); return tok }
 	svc := orderbookapp.New(client)
 
-	if watch {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		ch, err := svc.Stream(ctx, symbol, interval)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "stream error: %v\n", err)
-			return 1
-		}
-		for ob := range ch {
-			if depth > 0 {
-				if len(ob.Bids) > depth {
-					ob.Bids = ob.Bids[:depth]
-				}
-				if len(ob.Asks) > depth {
-					ob.Asks = ob.Asks[:depth]
-				}
-			}
-			enriched := enrichOrderbook(&ob)
-			outputJSON(enriched, true)
-		}
-		return 0
+	if flags["watch"] == "true" {
+		return streamOrderbook(svc, symbol, interval, depth)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -474,23 +518,29 @@ func runOrderbook(cfg config.Config, rest []string) int {
 	ob, err := svc.Get(ctx, symbol)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "orderbook error: %v\n", err)
-		hint := "save tokens from browser login via 'indostock auth save --token <JWT> --refresh <JWT> (or --stdin), then indostock auth status --json to verify.' (ADR-0009)"
-		if cfg.StockbitToken == "" {
-			hint += " | ADR-0009: server logins trigger OTP and fail; use browser token capture"
-		}
-		outputJSON(map[string]any{"error": err.Error(), "symbol": symbol, "hint": hint, "endpoint": "https://exodus.stockbit.com/company-price-feed/v2/orderbook/companies/" + symbol}, compact)
+		orderbookErrorHint(err, symbol, cfg.StockbitToken != "", compact)
 		return 1
 	}
-	if depth > 0 {
-		if len(ob.Bids) > depth {
-			ob.Bids = ob.Bids[:depth]
-		}
-		if len(ob.Asks) > depth {
-			ob.Asks = ob.Asks[:depth]
-		}
+	ob.Bids = clipDepth(ob.Bids, depth)
+	ob.Asks = clipDepth(ob.Asks, depth)
+	outputJSON(enrichOrderbook(ob), compact)
+	return 0
+}
+
+// streamOrderbook consumes the live orderbook stream until the channel closes.
+func streamOrderbook(svc *orderbookapp.Service, symbol string, interval, depth int) int {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch, err := svc.Stream(ctx, symbol, interval)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stream error: %v\n", err)
+		return 1
 	}
-	enriched := enrichOrderbook(ob)
-	outputJSON(enriched, compact)
+	for ob := range ch {
+		ob.Bids = clipDepth(ob.Bids, depth)
+		ob.Asks = clipDepth(ob.Asks, depth)
+		outputJSON(enrichOrderbook(&ob), true)
+	}
 	return 0
 }
 
@@ -653,38 +703,32 @@ func runSnapshot(cfg config.Config, rest []string) int {
 	return 0
 }
 
+// sideStats walks one side (bids/asks) of the raw JSON orderbook and
+// returns (best price, total lot volume).
+func sideStats(levels []any) (best float64, total int64) {
+	for _, b := range levels {
+		mm, ok := b.(map[string]any)
+		if !ok {
+			continue
+		}
+		if p, ok := mm["price"].(float64); ok && best == 0 {
+			best = p
+		}
+		if l, ok := mm["lot"].(float64); ok {
+			total += int64(l)
+		}
+	}
+	return best, total
+}
+
 func enrichOrderbook(v any) any {
 	b, _ := json.Marshal(v)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
 	bidsRaw, _ := m["bids"].([]any)
 	asksRaw, _ := m["asks"].([]any)
-	var bestBid, bestAsk float64
-	var bidVol, askVol int64
-	totalBidVol := int64(0)
-	totalAskVol := int64(0)
-	for _, b := range bidsRaw {
-		if mm, ok := b.(map[string]any); ok {
-			if p, ok := mm["price"].(float64); ok && bestBid == 0 {
-				bestBid = p
-			}
-			if l, ok := mm["lot"].(float64); ok {
-				totalBidVol += int64(l)
-			}
-		}
-	}
-	for _, a := range asksRaw {
-		if mm, ok := a.(map[string]any); ok {
-			if p, ok := mm["price"].(float64); ok && bestAsk == 0 {
-				bestAsk = p
-			}
-			if l, ok := mm["lot"].(float64); ok {
-				totalAskVol += int64(l)
-			}
-		}
-	}
-	bidVol = totalBidVol
-	askVol = totalAskVol
+	bestBid, bidVol := sideStats(bidsRaw)
+	bestAsk, askVol := sideStats(asksRaw)
 	spread := 0.0
 	mid := 0.0
 	if bestBid > 0 && bestAsk > 0 {
@@ -853,48 +897,50 @@ func mockHistory(symbol, interval, rangeStr string) []map[string]any {
 	return out
 }
 
-func runWhale(cfg config.Config, rest []string) int {
-	symbol, flags, compact, _, _ := parseFlags(rest, map[string]string{"z": "3.0", "window": "60"})
-	if symbol == "" {
-		fmt.Fprintln(os.Stderr, "whale: need SYMBOL, e.g. indostock whale BBCA --z 3 --mock")
-		return 1
-	}
-	zThresh := 3.0
-	fmt.Sscan(flags["z"], &zThresh)
-	window := 60
-	fmt.Sscan(flags["window"], &window)
-	mock := flags["mock"] == "true"
-	var candles []map[string]any
-	var latestVol int64
+// whaleInputs bundles candle history + latest volume from either mock or live.
+type whaleInputs struct {
+	candles   []map[string]any
+	latestVol int64
+	source    string
+}
+
+func gatherWhaleInputs(cfg config.Config, symbol string, mock, compact bool) (whaleInputs, int) {
+	var wi whaleInputs
 	if mock {
-		hist := mockHistory(symbol, "1d", "3mo")
-		candles = hist
-		if len(hist) > 0 {
-			if v, ok := hist[len(hist)-1]["volume"].(int64); ok {
-				latestVol = v
+		wi.candles = mockHistory(symbol, "1d", "3mo")
+		if n := len(wi.candles); n > 0 {
+			if v, ok := wi.candles[n-1]["volume"].(int64); ok {
+				wi.latestVol = v
 			}
 		}
 		// Sonar: no hidden random multiplier — mock volumes are already
 		// randomized by mockHistory, whale detection must stay deterministic
 		// on a given dataset.
-	} else {
-		client := yahoo.New(cfg.YahooBaseURL)
-		svc := quote.New(client)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		cs, err := svc.GetHistory(ctx, symbol, "1d", "3mo")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "whale history error: %v\n", err)
-			outputJSON(map[string]any{"error": err.Error(), "hint": "gunakan --mock"}, compact)
-			return 1
-		}
-		for _, c := range cs {
-			candles = append(candles, map[string]any{"volume": c.Volume, "close": c.Close})
-		}
-		if len(cs) > 0 {
-			latestVol = cs[len(cs)-1].Volume
-		}
+		wi.source = "mock"
+		return wi, 0
 	}
+	client := yahoo.New(cfg.YahooBaseURL)
+	svc := quote.New(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cs, err := svc.GetHistory(ctx, symbol, "1d", "3mo")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "whale history error: %v\n", err)
+		outputJSON(map[string]any{"error": err.Error(), "hint": "gunakan --mock"}, compact)
+		return wi, 1
+	}
+	for _, c := range cs {
+		wi.candles = append(wi.candles, map[string]any{"volume": c.Volume, "close": c.Close})
+	}
+	if len(cs) > 0 {
+		wi.latestVol = cs[len(cs)-1].Volume
+	}
+	wi.source = "live"
+	return wi, 0
+}
+
+// whaleWindowVolumes extracts the trailing window volumes before the latest.
+func whaleWindowVolumes(candles []map[string]any, window int) []float64 {
 	if window > len(candles)-1 {
 		window = len(candles) - 1
 	}
@@ -905,41 +951,62 @@ func runWhale(cfg config.Config, rest []string) int {
 	if start < 0 {
 		start = 0
 	}
-	var vols []float64
+	vols := make([]float64, 0, window)
 	for i := start; i < len(candles)-1; i++ {
-		if v, ok := candles[i]["volume"].(int64); ok {
+		switch v := candles[i]["volume"].(type) {
+		case int64:
 			vols = append(vols, float64(v))
-		} else if vf, ok := candles[i]["volume"].(float64); ok {
-			vols = append(vols, vf)
+		case float64:
+			vols = append(vols, v)
 		}
 	}
-	mean, std := meanStd(vols)
-	z := 0.0
-	relPct := 0.0
+	return vols
+}
+
+// whaleVerdict derives z-score, relative volume and the whale decision.
+func whaleVerdict(latestVol int64, vols []float64, zThresh float64) (z, relPct, mean, std, confidence float64, isWhale bool, reason string) {
+	mean, std = meanStd(vols)
 	if std > 0 {
 		z = (float64(latestVol) - mean) / std
 	}
 	if mean > 0 {
 		relPct = float64(latestVol) / mean * 100
 	}
-	isWhale := z >= zThresh || relPct >= 500
-	confidence := 0.0
-	reason := "no whale"
-	if isWhale {
-		confidence = 70 + (z-zThresh)*15
-		if relPct > 500 {
-			confidence += 5
-		}
-		if confidence > 99 {
-			confidence = 99
-		}
-		reason = fmt.Sprintf("whale detected Z=%.2f RelVol=%.0f%%", z, relPct)
+	isWhale = z >= zThresh || relPct >= 500
+	reason = "no whale"
+	if !isWhale {
+		return z, relPct, mean, std, 0, false, reason
 	}
+	confidence = 70 + (z-zThresh)*15
+	if relPct > 500 {
+		confidence += 5
+	}
+	if confidence > 99 {
+		confidence = 99
+	}
+	reason = fmt.Sprintf("whale detected Z=%.2f RelVol=%.0f%%", z, relPct)
+	return z, relPct, mean, std, confidence, true, reason
+}
+
+func runWhale(cfg config.Config, rest []string) int {
+	symbol, flags, compact, _, _ := parseFlags(rest, map[string]string{"z": "3.0", "window": "60"})
+	if symbol == "" {
+		fmt.Fprintln(os.Stderr, "whale: need SYMBOL, e.g. indostock whale BBCA --z 3 --mock")
+		return 1
+	}
+	zThresh := 3.0
+	fmt.Sscan(flags["z"], &zThresh)
+	window := 60
+	fmt.Sscan(flags["window"], &window)
+
+	wi, code := gatherWhaleInputs(cfg, symbol, flags["mock"] == "true", compact)
+	if code != 0 {
+		return code
+	}
+	vols := whaleWindowVolumes(wi.candles, window)
+	z, relPct, mean, std, confidence, isWhale, reason := whaleVerdict(wi.latestVol, vols, zThresh)
 	res := signal.WhaleResult{
-		Symbol: symbol, Volume: latestVol, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: isWhale, Confidence: confidence, Reason: reason, Source: "mock", Timestamp: time.Now(),
-	}
-	if !mock {
-		res.Source = "yahoo"
+		Symbol: symbol, Volume: wi.latestVol, MeanVol: mean, StdDev: std, ZScore: z, RelVolPct: relPct, IsWhale: isWhale, Confidence: confidence, Reason: reason, Source: wi.source, Timestamp: time.Now(),
 	}
 	outputJSON(res, compact)
 	return 0
@@ -1230,6 +1297,8 @@ func toFloatCandles(v any) float64 {
 // restoreSession validates the stored token at startup: valid → log, near
 // expiry → rotate, unusable → seed Redis from token.json (Sonar: cognitive
 // complexity — extracted from runServe).
+// restoreSession is intentionally simple: pick the best token source and act.
+// Kept flat by delegating each case to a helper below.
 func restoreSession(rc *cache.Client) {
 	if !rc.Available() {
 		fmt.Fprintln(os.Stderr, "redis: tidak tersedia, fallback ke file token.json")
@@ -1238,38 +1307,68 @@ func restoreSession(rc *cache.Client) {
 	// prefer token.json (single source of truth); Redis cache only helps
 	// if the file is unreadable. Rotation itself is lock-serialized
 	// inside auth.Refresh().
-	var tfTok *auth.StoredToken
-	if tf := auth.FindTokenFile(); tf != "" {
-		if tt, err := auth.LoadFrom(tf); err == nil && tt.AccessToken != "" {
-			tfTok = tt
-		}
-	}
+	tfTok := loadFileToken()
 	rt, _ := auth.LoadFromRedis(rc)
 	src := tfTok
 	if src == nil {
 		src = rt
 	}
 	switch {
-	case src != nil && src.AccessToken != "" && !auth.IsExpired(src, 5*time.Minute):
+	case isSessionValid(src):
 		fmt.Fprintf(os.Stderr, "session valid expires=%s remaining=%v (src=%s)\n", src.ExpiresAt.Format(time.RFC3339), time.Until(src.ExpiresAt).Round(time.Second), srcName(tfTok, rt))
-	case src != nil && src.AccessToken != "" && src.RefreshToken != "":
-		fmt.Fprintln(os.Stderr, "session hampir expired, rotate...")
-		if nt, err := auth.Refresh(src); err == nil {
-			_ = auth.SaveToRedis(rc, nt)
-			_ = auth.Save(nt, "")
-			fmt.Fprintf(os.Stderr, "rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
-		} else {
-			fmt.Fprintf(os.Stderr, "rotate gagal: %v\n", err)
-		}
+	case hasRefreshablePair(src):
+		rotateAndServe(rc, src)
 	case src != nil && src.AccessToken != "":
 		fmt.Fprintln(os.Stderr, "session expired tanpa refresh_token, butuh indostock auth save")
-	case tfTok == nil && rt == nil:
-		// nothing usable anywhere: seed redis from file if it has AT only
-		if t, err := auth.Load(); err == nil && t.AccessToken != "" {
-			_ = auth.SaveToRedis(rc, t)
-			fmt.Fprintf(os.Stderr, "redis: seeded dari file expires=%s\n", t.ExpiresAt.Format(time.RFC3339))
-		}
+	default:
+		seedRedisFromFile(rc, tfTok, rt)
 	}
+}
+
+func loadFileToken() *auth.StoredToken {
+	tf := auth.FindTokenFile()
+	if tf == "" {
+		return nil
+	}
+	tt, err := auth.LoadFrom(tf)
+	if err != nil || tt.AccessToken == "" {
+		return nil
+	}
+	return tt
+}
+
+func isSessionValid(t *auth.StoredToken) bool {
+	return t != nil && t.AccessToken != "" && !auth.IsExpired(t, 5*time.Minute)
+}
+
+func hasRefreshablePair(t *auth.StoredToken) bool {
+	return t != nil && t.AccessToken != "" && t.RefreshToken != ""
+}
+
+func rotateAndServe(rc *cache.Client, src *auth.StoredToken) {
+	fmt.Fprintln(os.Stderr, "session hampir expired, rotate...")
+	nt, err := auth.Refresh(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "rotate gagal: %v\n", err)
+		return
+	}
+	_ = auth.SaveToRedis(rc, nt)
+	_ = auth.Save(nt, "")
+	fmt.Fprintf(os.Stderr, "rotated new expiry %s\n", nt.ExpiresAt.Format(time.RFC3339))
+}
+
+// seedRedisFromFile populates Redis from token.json when neither source was
+// usable directly (file may hold an AT-only pair).
+func seedRedisFromFile(rc *cache.Client, tfTok, rt *auth.StoredToken) {
+	if tfTok != nil || rt != nil {
+		return
+	}
+	t, err := auth.Load()
+	if err != nil || t.AccessToken == "" {
+		return
+	}
+	_ = auth.SaveToRedis(rc, t)
+	fmt.Fprintf(os.Stderr, "redis: seeded dari file expires=%s\n", t.ExpiresAt.Format(time.RFC3339))
 }
 
 // loadCronToken picks the freshest stored token for the hourly cron: Redis

@@ -198,26 +198,40 @@ func LoadFrom(path string) (*StoredToken, error) {
 	return t, nil
 }
 
+// resolveTokenPath picks where token.json lives: explicit path, existing
+// file, or HOME/default candidates.
+func resolveTokenPath(path string) string {
+	if path != "" {
+		return path
+	}
+	if found := FindTokenFile(); found != "" {
+		return found
+	}
+	if h := os.Getenv("HOME"); h != "" {
+		p := filepath.Join(h, configDirName, appDirName, tokenFileName)
+		if h == "/root" || h == "" {
+			return defaultPaths[0]
+		}
+		return p
+	}
+	return defaultPaths[0]
+}
+
+// ensureExpiry fills ExpiresAt from the AT JWT (or 24h fallback).
+func ensureExpiry(t *StoredToken) {
+	if !t.ExpiresAt.IsZero() || t.AccessToken == "" {
+		return
+	}
+	if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
+		t.ExpiresAt = exp
+		return
+	}
+	t.ExpiresAt = time.Now().Add(24 * time.Hour)
+}
+
 func Save(t *StoredToken, path string) error {
-	if t.ExpiresAt.IsZero() && t.AccessToken != "" {
-		if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
-			t.ExpiresAt = exp
-		} else {
-			t.ExpiresAt = time.Now().Add(24 * time.Hour)
-		}
-	}
-	if path == "" {
-		if found := FindTokenFile(); found != "" {
-			path = found
-		} else if h := os.Getenv("HOME"); h != "" {
-			path = filepath.Join(h, configDirName, appDirName, tokenFileName)
-			if h == "/root" || h == "" {
-				path = defaultPaths[0]
-			}
-		} else {
-			path = defaultPaths[0]
-		}
-	}
+	ensureExpiry(t)
+	path = resolveTokenPath(path)
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
@@ -301,32 +315,42 @@ type refreshEnvelope struct {
 //  4. {"access_token":...,"refresh_token":...}
 //
 // Returns (access, refresh, accessExpiredAtRFC3339).
-func extractTokens(body []byte) (string, string, string) {
-	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
+// tokensFromNested extracts shapes 1&2: data.refresh.token_data / data.token_data
+func tokensFromNested(raw map[string]any) (string, string, string) {
+	d, ok := raw["data"].(map[string]any)
+	if !ok {
 		return "", "", ""
 	}
-	// shape 1 & 2: nested token_data/refresh objects
 	for _, mid := range []string{"refresh", "token_data"} {
-		if d, ok := raw["data"].(map[string]any); ok {
-			if td, ok := d[mid].(map[string]any); ok {
-				at, atExp := jwtFromObj(td, "access")
-				rt, _ := jwtFromObj(td, "refresh")
-				if at != "" {
-					return at, rt, atExp
-				}
-			}
+		td, ok := d[mid].(map[string]any)
+		if !ok {
+			continue
 		}
-	}
-	// shape 5 (actual exodus /login/refresh): data.access.token + data.refresh.token
-	if d, ok := raw["data"].(map[string]any); ok {
-		at, atExp := jwtFromObj(d, "access")
-		rt, _ := jwtFromObj(d, "refresh")
+		at, atExp := jwtFromObj(td, "access")
+		rt, _ := jwtFromObj(td, "refresh")
 		if at != "" {
 			return at, rt, atExp
 		}
 	}
-	// shape 3: data.access_token / data.refresh_token
+	return "", "", ""
+}
+
+// tokensFromExodus extracts shape 5: data.access.token + data.refresh.token
+func tokensFromExodus(raw map[string]any) (string, string, string) {
+	d, ok := raw["data"].(map[string]any)
+	if !ok {
+		return "", "", ""
+	}
+	at, atExp := jwtFromObj(d, "access")
+	rt, _ := jwtFromObj(d, "refresh")
+	if at != "" {
+		return at, rt, atExp
+	}
+	return "", "", ""
+}
+
+// tokensFromFlat extracts shapes 3&4: data.access_token / flat access_token
+func tokensFromFlat(raw map[string]any) (string, string, string) {
 	if d, ok := raw["data"].(map[string]any); ok {
 		at, _ := d["access_token"].(string)
 		rt, _ := d["refresh_token"].(string)
@@ -334,11 +358,25 @@ func extractTokens(body []byte) (string, string, string) {
 			return at, rt, ""
 		}
 	}
-	// shape 4: flat
 	at, _ := raw["access_token"].(string)
 	rt, _ := raw["refresh_token"].(string)
 	if at != "" {
 		return at, rt, ""
+	}
+	return "", "", ""
+}
+
+func extractTokens(body []byte) (string, string, string) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", "", ""
+	}
+	for _, fn := range []func(map[string]any) (string, string, string){
+		tokensFromNested, tokensFromExodus, tokensFromFlat,
+	} {
+		if at, rt, exp := fn(raw); at != "" {
+			return at, rt, exp
+		}
 	}
 	return "", "", ""
 }
@@ -427,12 +465,16 @@ func waitForPeerRotation(t *StoredToken) (*StoredToken, func(), bool) {
 	for i := 0; i < 12; i++ {
 		time.Sleep(500 * time.Millisecond)
 		if cur, err := loadBestToken(); err == nil && cur != nil && cur.RefreshToken != "" && cur.RefreshToken != t.RefreshToken {
+			// release is a no-op here: we never held the lock, the
+			// owning peer will release it themselves.
 			return cur, func() {}, true // peer's rotation produced a new pair; adopt it
 		}
 		if locked, r2 := acquireRefreshLock(); locked {
 			return nil, r2, false // we got the lock; caller proceeds to rotate
 		}
 	}
+	// release is a no-op: the caller only proceeds to rotate when locked
+	// is true; a false return means the caller never holds any lock.
 	return nil, func() {}, false
 }
 
@@ -472,6 +514,60 @@ func validateRotation(nt *StoredToken, oldRT, journal string) error {
 	return nil
 }
 
+// newRefreshRequest builds the exodus /login/refresh request for rt.
+func newRefreshRequest(rt string) (*http.Request, error) {
+	req, err := http.NewRequest("POST", "https://exodus.stockbit.com/login/refresh", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+rt)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
+	req.Header.Set("Origin", "https://stockbit.com")
+	req.Header.Set("Referer", "https://stockbit.com/")
+	return req, nil
+}
+
+// doRefreshCall performs the HTTP refresh call, returning the raw body.
+func doRefreshCall(rt string) ([]byte, error) {
+	req, err := newRefreshRequest(rt)
+	if err != nil {
+		return nil, err
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		n := len(body)
+		if n > 800 {
+			n = 800
+		}
+		return nil, fmt.Errorf("refresh failed %d: %s", resp.StatusCode, string(body[:n]))
+	}
+	return body, nil
+}
+
+// persistRotated saves the rotated pair to file + secondary store.
+func persistRotated(nt *StoredToken) {
+	path := FindTokenFile()
+	if path == "" {
+		path = TokenFileCandidates()[0]
+	}
+	_ = Save(nt, path)
+	// also save to secondary store if set (best-effort)
+	if s := getSecondaryStore(); s != nil {
+		if err := s.Save(nt); err != nil {
+			fmt.Fprintf(os.Stderr, "secondary store save failed: %v\n", err)
+		}
+	}
+}
+
+// Refresh rotates the token pair. It is the ONLY place the refresh call is
+// made; the single-writer lock inside serializes all trigger paths.
 func Refresh(t *StoredToken) (*StoredToken, error) {
 	if t.RefreshToken == "" {
 		return nil, fmt.Errorf("no refresh_token stored, need browser login once to capture refresh_token")
@@ -485,6 +581,17 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 	// startup, CLI, on-demand 401 retry) is serialized here. Without this,
 	// two concurrent refreshers can both get HTTP 200 and fork the token
 	// lineage — one of the two new pairs is silently invalid server-side.
+	nt, err := refreshLocked(t)
+	if err != nil {
+		return nil, err
+	}
+	persistRotated(nt)
+	return nt, nil
+}
+
+// refreshLocked acquires the single-writer lock and performs the rotation.
+// Peers mid-rotation are adopted instead of double-rotating.
+func refreshLocked(t *StoredToken) (*StoredToken, error) {
 	locked, release := acquireRefreshLock()
 	if !locked {
 		// someone else is rotating right now: poll for their result
@@ -506,33 +613,14 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 		}
 	}
 	defer release()
-	req, err := http.NewRequest("POST", "https://exodus.stockbit.com/login/refresh", nil)
+
+	body, err := doRefreshCall(t.RefreshToken)
 	if err != nil {
 		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+t.RefreshToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36")
-	req.Header.Set("Origin", "https://stockbit.com")
-	req.Header.Set("Referer", "https://stockbit.com/")
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		n := len(body)
-		if n > 800 {
-			n = 800
-		}
-		return nil, fmt.Errorf("refresh failed %d: %s", resp.StatusCode, string(body[:n]))
 	}
 	// journal raw response BEFORE parsing so a freshly-rotated token pair is
 	// never lost to a parser mismatch (Stockbit rotates refresh tokens on
 	// every use — after HTTP 200 the old pair is already dead server-side)
-	body, _ := io.ReadAll(resp.Body)
 	journal := journalRefreshResponse(body)
 	_ = os.WriteFile(filepath.Join(tokenDirOrTmp(), "last_refresh_response.json"), body, 0600)
 
@@ -541,18 +629,6 @@ func Refresh(t *StoredToken) (*StoredToken, error) {
 	nt := buildRotatedToken(t, at, rt, atExp)
 	if err := validateRotation(nt, t.RefreshToken, journal); err != nil {
 		return nil, err
-	}
-	// prefer existing file location
-	path := FindTokenFile()
-	if path == "" {
-		path = TokenFileCandidates()[0]
-	}
-	_ = Save(nt, path)
-	// also save to secondary store if set (best-effort)
-	if s := getSecondaryStore(); s != nil {
-		if err := s.Save(nt); err != nil {
-			fmt.Fprintf(os.Stderr, "secondary store save failed: %v\n", err)
-		}
 	}
 	return nt, nil
 }
@@ -673,17 +749,14 @@ func GetValidToken() (string, error) {
 // Rescue recovers the newest journaled refresh response: parse it, validate
 // the pair, and save to file + secondary store. This is the escape hatch if
 // a future API shape change breaks extractTokens after a rotation.
-func Rescue() (*StoredToken, string, error) {
-	body, journal, err := loadRefreshJournal()
-	if err != nil {
-		return nil, "", err
-	}
+// rescueParse validates the journaled body into a usable StoredToken.
+func rescueParse(body []byte, journal string) (*StoredToken, error) {
 	at, rt, atExp := extractTokens(body)
 	if at == "" || rt == "" {
-		return nil, journal, fmt.Errorf("journal %s does not contain a parsable token pair (shape changed again? body len %d)", journal, len(body))
+		return nil, fmt.Errorf("journal %s does not contain a parsable token pair (shape changed again? body len %d)", journal, len(body))
 	}
 	if exp := jwtExpiry(rt); !exp.IsZero() && exp.Before(time.Now()) {
-		return nil, journal, fmt.Errorf("journal %s refresh token already expired at %s — too late, browser login required", journal, exp.Format(time.RFC3339))
+		return nil, fmt.Errorf("journal %s refresh token already expired at %s — too late, browser login required", journal, exp.Format(time.RFC3339))
 	}
 	nt := &StoredToken{AccessToken: at, RefreshToken: rt}
 	if atExp != "" {
@@ -696,8 +769,26 @@ func Rescue() (*StoredToken, string, error) {
 			nt.ExpiresAt = exp
 		}
 	}
+	return nt, nil
+}
+
+// rescueNotNewer guards against downgrading to an already-retired pair.
+func rescueNotNewer(nt *StoredToken) bool {
+	cur, err := Load()
+	return err == nil && cur != nil && cur.RefreshToken == nt.RefreshToken
+}
+
+func Rescue() (*StoredToken, string, error) {
+	body, journal, err := loadRefreshJournal()
+	if err != nil {
+		return nil, "", err
+	}
+	nt, perr := rescueParse(body, journal)
+	if perr != nil {
+		return nil, journal, perr
+	}
 	// never downgrade: only save if journaled RT differs from current file RT
-	if cur, err := Load(); err == nil && cur != nil && cur.RefreshToken == rt {
+	if rescueNotNewer(nt) {
 		return nt, journal, fmt.Errorf("journal is not newer than current token (same refresh token) — nothing to rescue")
 	}
 	path := FindTokenFile()
@@ -859,30 +950,40 @@ func awaitPeerRotation(cacheClient redisTokenClient) (string, bool) {
 	return "", false
 }
 
+// redisTokenUsable checks whether t has a refreshable pair; if so it rotates
+// under the single-writer lock (or adopts a peer's in-flight rotation) and
+// returns the fresh access token.
+func redisTokenUsable(cacheClient redisTokenClient, t *StoredToken) (string, bool) {
+	if t.RefreshToken == "" {
+		return "", false
+	}
+	if locked, release := acquireRefreshLock(); locked {
+		// reload freshest under lock: a peer may have rotated
+		// already, and t's refresh token may be retired.
+		at, rerr := rotateUnderLock(cacheClient, t)
+		release()
+		return at, rerr == nil
+	}
+	at, ok := awaitPeerRotation(cacheClient)
+	return at, ok
+}
+
 func GetValidTokenRedis(cacheClient redisTokenClient) (string, error) {
 	if cacheClient == nil {
 		return GetValidToken()
 	}
-	if t, err := LoadFromRedis(cacheClient); err == nil && t.AccessToken != "" {
-		if !IsExpired(t, 5*time.Minute) {
-			return t.AccessToken, nil
-		}
-		if t.RefreshToken != "" {
-			if locked, release := acquireRefreshLock(); locked {
-				// reload freshest under lock: a peer may have rotated
-				// already, and t's refresh token may be retired.
-				at, rerr := rotateUnderLock(cacheClient, t)
-				release()
-				if rerr == nil {
-					return at, nil
-				}
-			} else if at, ok := awaitPeerRotation(cacheClient); ok {
-				return at, nil
-			}
-		}
-		if !IsExpired(t, 0) {
-			return t.AccessToken, nil
-		}
+	t, err := LoadFromRedis(cacheClient)
+	if err != nil || t.AccessToken == "" {
+		return GetValidToken()
+	}
+	if !IsExpired(t, 5*time.Minute) {
+		return t.AccessToken, nil
+	}
+	if at, ok := redisTokenUsable(cacheClient, t); ok {
+		return at, nil
+	}
+	if !IsExpired(t, 0) {
+		return t.AccessToken, nil
 	}
 	return GetValidToken()
 }
