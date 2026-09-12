@@ -178,12 +178,17 @@ func parseFlagArgs(rest []string, defaults map[string]string) (symbol string, va
 			vals[name[:eq]] = name[eq+1:]
 			continue
 		}
+		consumed := false
 		for _, known := range append(append([]string{}, stringFlags...), "json") {
 			if name == known && i+1 < len(rest) && !strings.HasPrefix(rest[i+1], "-") {
 				i++
 				vals[name] = rest[i]
+				consumed = true
 				break
 			}
+		}
+		if consumed {
+			continue // string flag took its value; never treat as boolean
 		}
 		if _, isBool := vals[name]; isBool && !strings.HasPrefix(a, "--json=") {
 			if strings.HasPrefix(a, "--") {
