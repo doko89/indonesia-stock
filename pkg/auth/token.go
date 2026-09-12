@@ -34,6 +34,7 @@ const (
 	configDirName   = ".config"
 	appDirName      = "indostock"
 	envTokenPrefix  = "STOCKBIT_TOKEN="
+	exportPrefix    = "export "
 	journalGlob     = "refresh_journal_*.json"
 	journalTimeFmt  = "20060102T150405"
 	journalKeepLast = 10
@@ -162,7 +163,7 @@ func tokenFromEnvStyle(s string) string {
 		if idx := strings.Index(line, envTokenPrefix); idx != -1 {
 			v := strings.TrimSpace(line[idx+len(envTokenPrefix):])
 			v = strings.Trim(v, "\"'")
-			v = strings.TrimPrefix(v, "export ")
+			v = strings.TrimPrefix(v, exportPrefix)
 			v = strings.Trim(v, "\"' ")
 			if v != "" {
 				return v
@@ -233,7 +234,10 @@ func Save(t *StoredToken, path string) error {
 	ensureExpiry(t)
 	path = resolveTokenPath(path)
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	// Sonar S5443: the token dir holds 0600 secrets, so never create it
+	// world-accessible. MkdirAll only sets perms on created dirs — existing
+	// user setups keep their current mode, so this changes nothing for them.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	tmp := path + ".tmp"
@@ -263,9 +267,7 @@ func jwtExpiry(tok string) time.Time {
 			return time.Time{}
 		}
 	}
-	var claims struct {
-		Exp int64 `json:"exp"`
-	}
+	var claims jwtClaims
 	if err := json.Unmarshal(b, &claims); err != nil || claims.Exp == 0 {
 		return time.Time{}
 	}
@@ -285,26 +287,35 @@ func IsExpired(t *StoredToken, buffer time.Duration) bool {
 	return time.Now().Add(buffer).After(t.ExpiresAt)
 }
 
+// jwtClaims is the minimal JWT payload the auth package inspects.
+type jwtClaims struct {
+	Exp int64 `json:"exp"`
+}
+
+// tokenHalf is one side (access or refresh) of a token pair inside a
+// refresh response.
+type tokenHalf struct {
+	Token     string `json:"token"`
+	ExpiredAt string `json:"expired_at"`
+}
+
 // tokenPayload is the nested access/refresh pair inside a refresh response
 // (named type per Sonar: anonymous struct extraction; also used by the
 // L251/L255 findings — same shape reused three times).
 type tokenPayload struct {
-	Access struct {
-		Token     string `json:"token"`
-		ExpiredAt string `json:"expired_at"`
-	} `json:"access"`
-	Refresh struct {
-		Token     string `json:"token"`
-		ExpiredAt string `json:"expired_at"`
-	} `json:"refresh"`
+	Access  tokenHalf `json:"access"`
+	Refresh tokenHalf `json:"refresh"`
+}
+
+// refreshData is the "data" object of a /login/refresh response body.
+type refreshData struct {
+	Refresh   tokenPayload `json:"refresh"`
+	TokenData tokenPayload `json:"token_data"`
 }
 
 // refreshEnvelope wraps tokenPayload shapes seen from /login/refresh.
 type refreshEnvelope struct {
-	Data struct {
-		Refresh   tokenPayload `json:"refresh"`
-		TokenData tokenPayload `json:"token_data"`
-	} `json:"data"`
+	Data refreshData `json:"data"`
 }
 
 // extractTokens pulls the rotated access/refresh token pair out of a refresh
@@ -406,9 +417,13 @@ func jwtFromObj(parent map[string]any, key string) (token, expiredAt string) {
 // old refresh token is dead server-side, so the response body is the ONLY
 // place the new pair exists. Keep the last 10 journals.
 func journalRefreshResponse(body []byte) string {
+	// Sonar S5443: never journal rotated secrets into a publicly writable
+	// dir — /tmp is shared across local users (symlink/squat attacks).
+	// The journal dir is the token dir when known, else a 0700 user-owned
+	// cache dir; filenames are unchanged.
 	dir := tokenDir()
 	if dir == "" {
-		dir = "/tmp"
+		dir = lockDir()
 	}
 	name := filepath.Join(dir, "refresh_journal_"+time.Now().UTC().Format(journalTimeFmt)+".json")
 	if err := os.WriteFile(name, body, 0600); err != nil {
@@ -640,7 +655,8 @@ func tokenDirOrTmp() string {
 	if d := tokenDir(); d != "" {
 		return d
 	}
-	return "/tmp"
+	// Sonar S5443: fall back to the 0700 user-owned cache dir, never /tmp.
+	return lockDir()
 }
 
 // ForceRefresh reloads current token and refreshes even if not expired, guarded by same lock.
@@ -873,10 +889,7 @@ func Status() map[string]any {
 
 const RedisKey = "indostock:auth:stockbit"
 
-func SaveToRedis(cacheClient interface {
-	Get(string) (string, error)
-	SetEx(string, string, time.Duration) error
-}, t *StoredToken) error {
+func SaveToRedis(cacheClient redisTokenClient, t *StoredToken) error {
 	if t.ExpiresAt.IsZero() && t.AccessToken != "" {
 		if exp := jwtExpiry(t.AccessToken); !exp.IsZero() {
 			t.ExpiresAt = exp
@@ -903,7 +916,13 @@ type redisTokenClient interface {
 	SetEx(string, string, time.Duration) error
 }
 
-func LoadFromRedis(cacheClient interface{ Get(string) (string, error) }) (*StoredToken, error) {
+// redisTokenGetter is the read-only half of redisTokenClient, for loads
+// that must not require write access.
+type redisTokenGetter interface {
+	Get(string) (string, error)
+}
+
+func LoadFromRedis(cacheClient redisTokenGetter) (*StoredToken, error) {
 	s, err := cacheClient.Get(RedisKey)
 	if err != nil {
 		return nil, err

@@ -27,6 +27,10 @@ type Config struct {
 	DatabaseURL     string
 }
 
+// exportPrefix is the shell prefix tolerated before STOCKBIT_TOKEN=
+// (const per Sonar S1192: duplicated string literal).
+const exportPrefix = "export "
+
 var authWiredOnce sync.Once
 
 // wiredCache is the redis client used for auth wiring, or nil when redis is
@@ -264,7 +268,7 @@ func readTokenFile(path string) string {
 		if idx := strings.Index(line, auth.EnvTokenPrefix); idx != -1 {
 			v := strings.TrimSpace(line[idx+len(auth.EnvTokenPrefix):])
 			// tolerate `export STOCKBIT_TOKEN=...` and quoted values
-			v = strings.TrimPrefix(v, "export ")
+			v = strings.TrimPrefix(v, exportPrefix)
 			v = strings.Trim(v, "\"' ")
 			if v != "" {
 				return v
