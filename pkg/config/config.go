@@ -196,7 +196,6 @@ func Load() Config {
 		DatabaseURL: env("DATABASE_URL", ""),
 	}
 }
-}
 
 func env(k, fallback string) string {
 	if v := os.Getenv(k); v != "" {
